@@ -29,7 +29,6 @@ import urllib.parse
 import uuid
 import webbrowser
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from html import escape, unescape
 from html.parser import HTMLParser
@@ -58,6 +57,16 @@ MP_COPYRIGHT_URL = "https://mp.weixin.qq.com/cgi-bin/appmsgcopyright"
 # 缓存后选中导出可直接定位评论，避免逐篇遍历 comment_id 列表。
 COMMENT_MAP_CACHE = Path(__file__).resolve().parent / "comment_map_cache.json"
 
+# 读者模式（抓别人公众号精选评论）：mitmproxy 采集微信登录态凭证
+MITM_VENV = SCRIPT_DIR / ".mitmvenv"
+MITMDUMP = MITM_VENV / "Scripts" / "mitmdump.exe"
+MITM_PLUGIN = SCRIPT_DIR / "mitm_cred.py"
+READER_CRED_FILE = SCRIPT_DIR / "credentials.json"
+READER_ARTICLE_FILE = SCRIPT_DIR / "articles.json"
+MITM_PROXY_PORT = 65000
+MITM_CA_CER = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.cer"
+MITM_LOG = SCRIPT_DIR / "mitm.log"
+MITM_ERR = SCRIPT_DIR / "mitm.err"
 
 # 全局配置与任务状态
 CONFIG = {}
@@ -74,6 +83,10 @@ LOGIN_STATE = {
     "mp": {"status": "idle", "message": "", "qrcode": "", "token": "", "fingerprint": "", "cookie": ""},
 }
 LOGIN_LOCK = threading.Lock()
+
+# mitmproxy 采集状态（读者模式）
+MITM_STATE = {"running": False, "proc": None, "message": ""}
+MITM_LOCK = threading.Lock()
 
 
 def _set_login(kind: str, status: str, message: str = "", **extra):
@@ -437,6 +450,29 @@ def new_task_id() -> str:
         return f"task_{SEQUENCE[0]}"
 
 
+class TaskStopped(Exception):
+    """任务被用户主动停止（用于拉取/导出中途退出）。"""
+
+
+def _check_stop(task):
+    """若任务被标记停止，抛出 TaskStopped，供各循环中途退出。"""
+    if task and task.get("stop"):
+        raise TaskStopped()
+
+
+def _parse_date_ts(s, end: bool = False):
+    """把 'YYYY-MM-DD' 转为时间戳；end=True 取当天 23:59:59。解析失败/为空返回 None。"""
+    if not s:
+        return None
+    try:
+        dt = datetime.strptime(str(s).strip(), "%Y-%m-%d")
+    except Exception:
+        return None
+    if end:
+        dt = dt.replace(hour=23, minute=59, second=59)
+    return int(dt.timestamp())
+
+
 def task_log(task: dict, msg: str):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
     task["log"].append(line)
@@ -471,35 +507,6 @@ def weread_get_html(cookie: str, path: str, params=None) -> str:
     resp = sess.get(f"{WEREAD_HOST}{path}", params=params, headers={"Cookie": cookie}, timeout=40)
     resp.raise_for_status()
     return resp.text
-
-
-def weread_get_ogurl(cookie: str, review_id: str) -> str:
-    """流式访问微信读书正文接口，只读到 og:url 就断连，省掉后续约 2.6MB 下载。
-
-    实测：/web/mp/content 返回 chunked + gzip，og:url 在解压后约 18.8KB 处（首个 24KB 块内）。
-    og:url 的值是 URL（纯 ASCII），用 bytes 正则匹配，避免 chunk 边界把中文切半。
-    返回值为反转义后的 og:url（&amp; -> &）；未命中返回空字符串。
-    """
-    rid = urllib.parse.quote(review_id)
-    sess = _weread_session()
-    sess.headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    url = f"{WEREAD_HOST}/web/mp/content"
-    pat1 = re.compile(rb'<meta\b[^>]*property=["\']og:url["\'][^>]*content=["\']([^"\']*)["\']', re.I)
-    pat2 = re.compile(rb'<meta\b[^>]*content=["\']([^"\']*)["\'][^>]*property=["\']og:url["\']', re.I)
-    buf = b""
-    with sess.get(url, params={"reviewId": rid}, headers={"Cookie": cookie},
-                  stream=True, timeout=40) as resp:
-        resp.raise_for_status()
-        for chunk in resp.iter_content(chunk_size=8192):
-            if not chunk:
-                continue
-            buf += chunk
-            m = pat1.search(buf) or pat2.search(buf)
-            if m:
-                return unescape(m.group(1).decode("utf-8", "ignore")).strip()
-            if len(buf) >= 512 * 1024:  # 兜底上限，正常 20KB 内就该命中
-                break
-    return ""
 
 
 def resolve_book_id(cookie: str, keyword: str):
@@ -621,12 +628,15 @@ def _flatten_reviews(reviews: list) -> list:
     return items
 
 
-def fetch_all_articles(cookie: str, book_id: str, task=None, max_articles=0, on_page=None):
+def fetch_all_articles(cookie: str, book_id: str, task=None, max_articles=0, on_page=None,
+                       date_from: str = "", date_to: str = ""):
     """微信读书整号文章列表（/web/mp/articles）。
 
     关键：offset 是「列表偏移量」（每页返回多少条就递增多少），不是时间戳游标。
     之前误用时间戳当 offset，第二页 offset 越界返回空，导致只拉到第一页 20 篇。
     on_page(articles)：每拉完一页回调一次，用于前端增量渲染。
+    date_from/date_to：可选时间范围（YYYY-MM-DD），按 article['time'] 过滤；列表按时间倒序，
+    一旦整页都比 date_from 更旧即停止翻页，避免为增量拉取翻完全部历史。
     """
     articles = []
     seen = set()
@@ -635,7 +645,10 @@ def fetch_all_articles(cookie: str, book_id: str, task=None, max_articles=0, on_
     first_data = None  # 第一页响应，用于提取公众号名称
     list_mp_name = ""  # 列表响应里的公众号名称（mpInfo.mp_name，最可靠）
     activated = False  # 是否已尝试激活终端会话（-2041）
+    ts_from = _parse_date_ts(date_from)
+    ts_to = _parse_date_ts(date_to, end=True)
     while True:
+        _check_stop(task)
         page += 1
         try:
             data = weread_get(cookie, "/web/mp/articles", {"bookId": book_id, "offset": offset})
@@ -677,7 +690,9 @@ def fetch_all_articles(cookie: str, book_id: str, task=None, max_articles=0, on_
         page_items = _flatten_reviews(reviews)
         if not page_items:
             break
-        new_in_page = 0
+        page_times = []
+        new_unique = 0   # 本页新增的唯一文章（未见过），用于判断是否翻到底
+        new_in_page = 0  # 本页通过时间过滤后实际加入的文章
         for it in page_items:
             title = (it.get("title") or "").strip()
             # 公众号名称：列表响应 mpInfo.mp_name 字段（最可靠，直接取第一篇）
@@ -692,6 +707,18 @@ def fetch_all_articles(cookie: str, book_id: str, task=None, max_articles=0, on_
             if key in seen:
                 continue
             seen.add(key)
+            new_unique += 1
+            # 时间范围过滤（列表按时间倒序，晚于结束日期/早于起始日期的都跳过）
+            try:
+                it_ts = int(it.get("time") or 0)
+            except Exception:
+                it_ts = 0
+            if it_ts:
+                page_times.append(it_ts)
+            if ts_from and it_ts and it_ts < ts_from:
+                continue
+            if ts_to and it_ts and it_ts > ts_to:
+                continue
             # reviewId 优先用接口返回的，否则按 {bookId}_{originalId} 拼接
             review_id = (it.get("reviewId") or it.get("review_id")
                          or (f"{book_id}_{original_id}" if original_id else ""))
@@ -709,12 +736,17 @@ def fetch_all_articles(cookie: str, book_id: str, task=None, max_articles=0, on_
             task_log(task, f"  文章列表第 {page} 页：本页 {len(page_items)} 条，新增 {new_in_page}，累计 {len(articles)} 篇")
         if on_page:
             on_page(articles)
+        # 整页都比起始日期更旧：列表按时间倒序，后续只会更旧，直接停止翻页
+        if ts_from and page_times and max(page_times) < ts_from:
+            if task:
+                task_log(task, "  已到达起始日期，停止翻页")
+            break
         if max_articles and len(articles) >= max_articles:
             break
         # 翻页：offset 递增本页原始返回条数（列表偏移量语义）
         offset += len(page_items)
-        # 本页全部重复（offset 步长与返回数不一致时可能出现），说明已到底，避免死循环
-        if new_in_page == 0:
+        # 本页没有新增唯一文章（全部重复），说明已到底，避免死循环
+        if new_unique == 0:
             break
         if page >= 200:  # 安全上限，防止意外死循环
             break
@@ -799,69 +831,6 @@ def _weread_mp_name(cookie: str, book_id: str, articles: list, first_data=None) 
     return ""
 
 
-def attach_short_urls(cookie: str, articles: list, task=None, threads: int = 4,
-                      save_path: Path = None) -> list:
-    """对每篇文章拉微信读书正文，提取 og:url 短链存到 article['url']。
-
-    拿到短链后，下载正文即可免 Cookie 直访 mp.weixin.qq.com 短链、支持多线程并发。
-    save_path 传入时增量保存：每拿到一条新短链就把当前已提取的结果重写入该文件，
-    程序中途出错也能保留已拿到的部分。
-    """
-    if not articles:
-        return articles
-    total = len(articles)
-
-    def _one(art):
-        if art.get("url"):
-            return art, art["url"]
-        rid = art.get("review_id") or ""
-        if not rid:
-            return art, ""
-        try:
-            url = weread_get_ogurl(cookie, rid)
-            if not url:
-                # 流式未命中（异常或页面结构变化），回退完整下载再提 og:url
-                html = fetch_article_html(cookie, rid)
-                url = extract_meta(html, "og:url") or ""
-            return art, url
-        except Exception:
-            return art, ""
-
-    done = 0
-    with ThreadPoolExecutor(max_workers=max(1, int(threads))) as ex:
-        futures = [ex.submit(_one, art) for art in articles]
-        for fut in as_completed(futures):
-            art, url = fut.result()
-            if url:
-                art["url"] = url
-                if save_path:
-                    save_short_urls_file(articles, "", path=save_path)
-            done += 1
-            if task and (done % 10 == 0 or done == total):
-                task_log(task, f"  提取短链 {done}/{total}")
-    return articles
-
-
-def save_short_urls_file(articles: list, mp_name: str, path: Path = None) -> Path:
-    """把文章短链保存到 output 目录下的 txt 文件（文件名带日期和公众号名，如 261020XXX公众号文章链接.txt）。
-
-    path 不传时按当天日期生成；attach_short_urls 增量保存时传入同一 path 复用。
-    """
-    if path is None:
-        date = datetime.now().strftime("%y%m%d")
-        safe_name = sanitize(mp_name or "未知公众号")
-        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-        path = OUTPUT_ROOT / f"{date}{safe_name}公众号文章链接.txt"
-    lines = []
-    for art in articles:
-        url = art.get("url") or ""
-        title = art.get("title") or ""
-        if url:
-            lines.append(f"{title}\t{url}")
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return path
-
-
 def _mp_page_headers(cookie: str) -> dict:
     return {
         "User-Agent": UA,
@@ -914,19 +883,25 @@ def _extract_cgidata_list(html: str):
     return [], total
 
 
-def fetch_all_articles_from_mp(cookie: str, token: str, task=None, max_articles=0, on_page=None):
+def fetch_all_articles_from_mp(cookie: str, token: str, task=None, max_articles=0, on_page=None,
+                               date_from: str = "", date_to: str = ""):
     """从公众号后台「原创」列表（appmsgcopyright?action=orignal）分页拉取全部文章。
 
     只需 token + 后台 Cookie（无需 fingerprint）。返回 (articles, mp_name)。
     articles 每项：title / url(短链接) / msgid / index / create_time / time / reprint_num。
     on_page(articles)：每拉完一页回调一次，用于前端增量渲染。
+    date_from/date_to：可选时间范围（YYYY-MM-DD），按 article['time'] 过滤；列表按时间倒序，
+    一旦整页都比 date_from 更旧即停止翻页，避免为增量拉取翻完全部历史。
     """
     articles = []
     seen = set()
     mp_name = ""
     begin = 0  # 注意：begin 从 0 开始（第一页是 begin=0），从 1 开始会漏掉第一页 10 篇
     total = 0
+    ts_from = _parse_date_ts(date_from)
+    ts_to = _parse_date_ts(date_to, end=True)
     while True:
+        _check_stop(task)
         params = {
             "action": "orignal",
             "type": "1",
@@ -947,6 +922,8 @@ def fetch_all_articles_from_mp(cookie: str, token: str, task=None, max_articles=
         lst, total = _extract_cgidata_list(html)
         if not lst:
             break
+        page_times = []
+        new_unique = 0   # 本页新增的唯一文章（未见过），用于判断是否翻到底
         for it in lst:
             msgid = str(it.get("msgid") or "")
             idx = str(it.get("index") or "")
@@ -954,6 +931,18 @@ def fetch_all_articles_from_mp(cookie: str, token: str, task=None, max_articles=
             if not key or key in seen:
                 continue
             seen.add(key)
+            new_unique += 1
+            # 时间范围过滤（列表按时间倒序，晚于结束日期/早于起始日期的都跳过）
+            try:
+                it_ts = int(it.get("update_time") or 0)
+            except Exception:
+                it_ts = 0
+            if it_ts:
+                page_times.append(it_ts)
+            if ts_from and it_ts and it_ts < ts_from:
+                continue
+            if ts_to and it_ts and it_ts > ts_to:
+                continue
             articles.append({
                 "title": it.get("title") or "",
                 "url": it.get("url") or "",
@@ -967,9 +956,16 @@ def fetch_all_articles_from_mp(cookie: str, token: str, task=None, max_articles=
             task_log(task, f"  原创列表第 {begin} 页：累计 {len(articles)}/{total or '?'} 篇")
         if on_page:
             on_page(articles)
+        # 整页都比起始日期更旧：列表按时间倒序，后续只会更旧，直接停止翻页
+        if ts_from and page_times and max(page_times) < ts_from:
+            if task:
+                task_log(task, "  已到达起始日期，停止翻页")
+            break
         if max_articles and len(articles) >= max_articles:
             break
         if total and len(articles) >= total:
+            break
+        if new_unique == 0:  # 本页没有新增唯一文章，避免死循环
             break
         if begin >= 100:  # 安全上限，防止意外死循环
             break
@@ -1749,11 +1745,15 @@ def _export_one(art: dict, out_dir: Path, formats: set, comments_by_mid: dict,
                 layout: str, download_images: bool, cookie: str):
     """导出单篇文章，返回 (success, comment_count, logs)。
 
-    多线程安全：每篇独立目录（subdir）或独立文件名（flat），图片目录按文章名区分。
+    每篇独立目录（subdir）或独立文件名（flat），图片目录按文章名区分。
     """
     logs = []
     if art.get("_raw_html"):
         raw_html = art["_raw_html"]
+    elif art.get("review_id") and cookie:
+        # 微信读书接口走登录态，风控宽松；mp.weixin.qq.com 直访批量请求
+        # 易触发 IP 风控（返回 captcha 验证页），故仅作回退（模式1/3 场景）
+        raw_html = fetch_article_html(cookie, art["review_id"])
     elif art.get("url"):
         raw_html = fetch_article_html_direct(art["url"])
     elif art.get("review_id"):
@@ -1828,6 +1828,13 @@ def export_worker(task_id: str):
     task = TASKS[task_id]
     cfg = task["cfg"]
     try:
+        # 预置变量，确保中途停止/异常时也能安全引用
+        articles = []
+        ok = 0
+        total_comments = 0
+        results = []
+        out_dir = None
+        formats = set()
         cookie = cfg.get("weread_cookie", "")
         keyword = cfg.get("keyword", "")
         token = cfg.get("token", "")
@@ -1838,8 +1845,9 @@ def export_worker(task_id: str):
         if selected:
             # 选中模式：直接使用前端传入的文章列表，不再重新拉取
             articles = selected
-            book_id = cfg.get("book_id") or ""
-            mp_name = cfg.get("mp_name") or ""
+            # 名称兜底：前端未带时用本次会话缓存的公众号名/bookId，避免文件夹退化成「article」
+            book_id = cfg.get("book_id") or CACHE.get("book_id") or ""
+            mp_name = cfg.get("mp_name") or CACHE.get("mp_name") or ""
             CACHE["book_id"] = book_id
             CACHE["mp_name"] = mp_name
             task_log(task, f"使用选中的 {len(articles)} 篇文章")
@@ -1885,7 +1893,7 @@ def export_worker(task_id: str):
                 cred = {}
 
         # 选中模式：先预抓选中文章正文，提取 mid（用于评论定位）
-        # 仅当需要拉评论（有后台凭证）时才预抓取；无评论时正文在多线程导出阶段并发拉取
+        # 仅当需要拉评论（有后台凭证）时才预抓取；无评论时正文在串行导出阶段拉取
         selected_mids = set()
         selected_had_mids = False
         if selected and cred:
@@ -1966,7 +1974,8 @@ def export_worker(task_id: str):
 
         # 输出目录（文件夹名带导出日期，如 相声的技术备忘录_2026-10-19）
         export_date = datetime.now().strftime("%Y-%m-%d")
-        base_dir_name = sanitize(mp_name or book_id)
+        # 文件夹名优先用公众号名，其次 bookId，最后兜底「未命名公众号」（不再退化成 article）
+        base_dir_name = sanitize(mp_name or book_id or "未命名公众号")
         out_dir = Path(cfg.get("output_dir") or OUTPUT_ROOT) / f"{base_dir_name}_{export_date}"
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1986,49 +1995,54 @@ def export_worker(task_id: str):
             formats = {"markdown"}
         task_log(task, f"导出格式：{', '.join(sorted(formats))}")
 
-        # 导出选项：布局（每篇子文件夹 / 平铺）+ 是否下载图片 + 并发线程数
+        # 导出选项：布局（每篇子文件夹 / 平铺）+ 是否下载图片（串行导出，防风控）
         layout = str(cfg.get("layout") or "subdir")
         download_images = bool(cfg.get("download_images", True))
-        threads = max(1, min(int(cfg.get("threads", 0) or 4), 16))
         task_log(task, f"布局：{'平铺到同一目录' if layout == 'flat' else '每篇一个子文件夹'}，"
-                       f"图片：{'下载' if download_images else '不下载'}，并发线程：{threads}")
+                       f"图片：{'下载' if download_images else '不下载'}，串行下载（防风控）")
 
-        # 逐篇导出（多线程并发）
+        # 逐篇串行导出：慢但稳定，避免并发请求触发微信风控
         ok = 0
         total_comments = 0
-        done = 0
-        done_lock = threading.Lock()
         total = len(articles)
+        results = []  # 每篇结果：{uid, title, success, error}，供前端移除成功项/保留失败项
 
-        def _run(art):
-            return _export_one(art, out_dir, formats, comments_by_mid,
-                               layout, download_images, cookie)
-
-        with ThreadPoolExecutor(max_workers=threads) as ex:
-            futures = {ex.submit(_run, art): art for art in articles}
-            for fut in as_completed(futures):
-                art = futures[fut]
-                try:
-                    success, cc, logs = fut.result()
-                except Exception as e:
-                    success, cc, logs = False, 0, []
-                    task_log(task, f"  [失败] {art['title'][:40]}：{e}")
-                with done_lock:
-                    if success:
-                        ok += 1
-                        total_comments += cc
-                    done += 1
-                    n = done
-                for lg in logs:
-                    task_log(task, f"  {art['title'][:40]}：{lg}")
-                if success:
-                    task_log(task, f"[{n}/{total}] {art['title'][:40]}")
+        for n, art in enumerate(articles, 1):
+            _check_stop(task)  # 用户点「停止下载」后在此退出
+            err_msg = ""
+            try:
+                success, cc, logs = _export_one(art, out_dir, formats, comments_by_mid,
+                                                layout, download_images, cookie)
+            except Exception as e:
+                success, cc, logs = False, 0, []
+                err_msg = str(e)
+                task_log(task, f"  [失败] {art['title'][:40]}：{e}")
+            if success:
+                ok += 1
+                total_comments += cc
+            for lg in logs:
+                task_log(task, f"  {art['title'][:40]}：{lg}")
+            if success:
+                task_log(task, f"[{n}/{total}] {art['title'][:40]}")
+            results.append({"uid": art.get("uid"), "title": art.get("title", ""),
+                            "success": success, "error": err_msg})
+            # 实时进度：每完成一篇就暴露给前端，列表可即时移除成功项/标红失败项
+            task["results_sofar"] = list(results)
+            # 串行限速：篇与篇之间暂停，降低风控概率
+            time.sleep(1.2)
 
         task["result"] = {"ok": ok, "total": len(articles), "comments": total_comments,
-                          "formats": sorted(formats), "dir": str(out_dir)}
+                          "formats": sorted(formats), "dir": str(out_dir), "results": results}
         task["status"] = "done"
         task_log(task, f"完成：成功 {ok}/{len(articles)} 篇，共 {total_comments} 条评论，格式 {', '.join(sorted(formats))}")
         task_log(task, f"输出目录：{out_dir}")
+    except TaskStopped:
+        task["status"] = "stopped"
+        task["result"] = {"ok": ok, "total": len(articles), "comments": total_comments,
+                          "formats": sorted(formats),
+                          "dir": str(out_dir) if out_dir else "",
+                          "results": results, "stopped": True}
+        task_log(task, "已停止下载（剩余文章保留在列表，可再次点击下载继续）")
     except Exception as e:
         task["status"] = "error"
         task["error"] = str(e)
@@ -2036,16 +2050,357 @@ def export_worker(task_id: str):
 
 
 # ---------------------------------------------------------------------------
+# 读者模式：mitmproxy 采集微信登录态凭证 + 抓取精选评论
+# ---------------------------------------------------------------------------
+
+def _win_proxy(enable: bool, proxy: str = "") -> None:
+    """设置 / 清除 Windows 系统代理（WinINET，当前用户，无需管理员）。"""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                             0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1 if enable else 0)
+        if proxy:
+            winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, proxy)
+        # 本机服务不走代理，避免杀掉 mitmproxy 时切断页面与后端的通信
+        winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ,
+                          "127.0.0.1;localhost;<local>")
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+    # 通知系统刷新代理设置，让已运行的进程尽快感知
+    try:
+        import ctypes
+        ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)
+        ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)
+    except Exception:
+        pass
+
+
+def _wechat_proc_info() -> dict:
+    """检测微信进程状态：Weixin.exe 主进程启动时间 + WeChatAppEx.exe 文章窗口数。"""
+    try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-Process Weixin,WeChatAppEx -ErrorAction SilentlyContinue | "
+             "ForEach-Object { try { '{0}|{1:yyyy-MM-dd HH:mm:ss}' -f $_.Name, $_.StartTime } catch {} }"],
+            capture_output=True, text=True, timeout=10, creationflags=creationflags)
+        main_start = ""
+        ex_count = 0
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            name, _, st = line.partition("|")
+            if name.lower() == "weixin":
+                if not main_start or st < main_start:
+                    main_start = st
+            elif name.lower() == "wechatappex":
+                ex_count += 1
+        return {"main_start": main_start, "ex_count": ex_count}
+    except Exception:
+        return {"main_start": "", "ex_count": 0}
+
+
+def _install_mitm_cert() -> bool:
+    """安装 mitmproxy CA 到「当前用户」根证书库（无需管理员）。"""
+    if not MITM_CA_CER.exists():
+        return False
+    try:
+        r = subprocess.run(["certutil", "-user", "-addstore", "root", str(MITM_CA_CER)],
+                           capture_output=True, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _start_mitmdump():
+    """启动 mitmdump 子进程，返回 (proc, err)。"""
+    if not MITMDUMP.exists():
+        return None, f"未找到 mitmdump（{MITMDUMP}）。请先在 .mitmvenv 里安装 mitmproxy。"
+    try:
+        out = open(MITM_LOG, "a", encoding="utf-8")
+        err = open(MITM_ERR, "a", encoding="utf-8")
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        proc = subprocess.Popen(
+            [str(MITMDUMP), "-p", str(MITM_PROXY_PORT), "-s", "mitm_cred.py"],
+            cwd=str(SCRIPT_DIR), stdout=out, stderr=err, creationflags=creationflags)
+        return proc, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _kill_mitmdump():
+    """强制结束所有 mitmdump.exe 进程，确保下次启动加载最新插件代码。"""
+    if os.name != "nt":
+        return
+    try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(["taskkill", "/F", "/IM", "mitmdump.exe"],
+                       capture_output=True, timeout=15, creationflags=creationflags)
+    except Exception:
+        pass
+
+
+def start_reader_capture():
+    """启动凭证采集：装证书 + 起 mitmdump + 设系统代理。"""
+    global MITM_STATE
+    with MITM_LOCK:
+        if MITM_STATE["running"]:
+            return False, "采集已在运行中"
+        # 只保留本次采集的记录：清空上一轮的凭证与文章列表
+        try:
+            READER_CRED_FILE.write_text("[]", encoding="utf-8")
+            READER_ARTICLE_FILE.write_text("[]", encoding="utf-8")
+        except Exception:
+            pass
+        # 清理残留的 mitmdump（端口占用会导致新插件不生效）
+        _kill_mitmdump()
+        time.sleep(0.5)
+        MITM_STATE["wechat_start0"] = _wechat_proc_info().get("main_start", "")
+        cert_ok = _install_mitm_cert()
+        proc, err = _start_mitmdump()
+        if proc is None:
+            return False, err
+        time.sleep(1.0)
+        _win_proxy(True, f"127.0.0.1:{MITM_PROXY_PORT}")
+        MITM_STATE["running"] = True
+        MITM_STATE["proc"] = proc
+        MITM_STATE["message"] = ("证书已安装" if cert_ok else "⚠ 证书安装失败，可能无法解密 HTTPS")
+        return True, "采集已启动：请完全退出并重开微信，然后打开要抓取的公众号文章"
+
+
+def stop_reader_capture():
+    """停止采集：恢复系统代理 + 结束 mitmdump。"""
+    global MITM_STATE
+    with MITM_LOCK:
+        _win_proxy(False)
+        proc = MITM_STATE.get("proc")
+        if proc:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        _kill_mitmdump()
+        MITM_STATE["running"] = False
+        MITM_STATE["proc"] = None
+        MITM_STATE["message"] = ""
+        return True, "已停止采集，系统代理已恢复"
+
+
+def _reader_capture_status() -> dict:
+    creds = load_reader_credentials()
+    arts = load_reader_articles()
+    # 每个公众号统计本次打开的文章数
+    art_count = {}
+    for a in arts:
+        if a.get("biz"):
+            art_count[a["biz"]] = art_count.get(a["biz"], 0) + 1
+    info = _wechat_proc_info() if MITM_STATE.get("running") else {"main_start": "", "ex_count": 0}
+    main_start = info.get("main_start", "")
+    start0 = MITM_STATE.get("wechat_start0", "")
+    return {
+        "running": bool(MITM_STATE.get("running")),
+        "message": MITM_STATE.get("message", ""),
+        "cred_count": len(creds),
+        "credentials": [{"biz": b, "name": c.get("name", ""),
+                         "article_count": art_count.get(b, 0)} for b, c in creds.items()],
+        "article_count": len(arts),
+        "articles": [{"biz": a.get("biz", ""), "title": a.get("title", ""),
+                      "url": a.get("url", "")} for a in arts],
+        "wechat_running": bool(main_start),
+        "wechat_start": main_start,
+        "wechat_restarted": bool(main_start) and main_start != start0,
+    }
+
+
+def load_reader_articles() -> list:
+    """读取 articles.json：本次采集中打开的文章列表 [{biz,url,title,timestamp}]。"""
+    if not READER_ARTICLE_FILE.exists():
+        return []
+    try:
+        data = json.loads(READER_ARTICLE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def load_reader_credentials() -> dict:
+    """读取 credentials.json，解析为 {biz: {uin,key,pass_ticket,appmsg_token,name}}。"""
+    result = {}
+    if not READER_CRED_FILE.exists():
+        return result
+    try:
+        data = json.loads(READER_CRED_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return result
+    if not isinstance(data, list):
+        return result
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        biz = item.get("biz", "")
+        if not biz:
+            continue
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(item.get("url", "")).query)
+        key = (qs.get("key") or [""])[0]
+        uin = (qs.get("uin") or [""])[0]
+        sc = item.get("set_cookie", "")
+
+        def _gc(name):
+            m = re.search(name + r'=([^;]+)', sc)
+            return m.group(1) if m else ""
+
+        result[biz] = {
+            "biz": biz,
+            "uin": uin,
+            "key": key,
+            "pass_ticket": _gc("pass_ticket"),
+            "appmsg_token": _gc("appmsg_token"),
+            "name": item.get("name", ""),
+        }
+    return result
+
+
+def extract_idx_from_html(html: str) -> str:
+    for pat in (r'var\s+idx\s*=\s*["\'](\d+)["\']',
+                r'idx\s*:\s*["\']?(\d+)["\']?'):
+        m = re.search(pat, html or "")
+        if m and m.group(1):
+            return m.group(1)
+    return "1"
+
+
+def extract_comment_id_from_html(html: str) -> str:
+    for pat in (r'var\s+comment_id\s*=\s*["\'](\d+)["\']',
+                r'comment_id\s*[:=]\s*["\']?(\d+)["\']?'):
+        m = re.search(pat, html or "")
+        if m and m.group(1):
+            return m.group(1)
+    return ""
+
+
+def extract_publish_time(html: str) -> int:
+    """从文章 HTML 提取发布时间（Unix 秒），提取不到返回 0。"""
+    if not html:
+        return 0
+    # var ct = "176xxxxxxx"（Unix 秒）
+    m = re.search(r'var\s+ct\s*=\s*["\']?(\d{10})["\']?', html)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    # createTime / publish_time 等数字形式
+    for name in ("createTime", "publish_time", "create_time", "CreateTime"):
+        m = re.search(name + r'\s*[:=]\s*["\']?(\d{10})["\']?', html)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    # 日期字符串 "2026-10-19"
+    m = re.search(r'(20\d{2})[-/](\d{1,2})[-/](\d{1,2})', html)
+    if m:
+        try:
+            return int(datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).timestamp())
+        except Exception:
+            pass
+    return 0
+
+
+def fetch_reader_article_comments(article_url: str, creds: dict) -> dict:
+    """读者视角抓取单篇文章的精选评论（getcomment 接口）。
+
+    返回结构与 fetch_article_comments 一致：{title, comments:[...], total_count, ...}。
+    """
+    try:
+        import urllib3
+        urllib3.disable_warnings()
+    except Exception:
+        pass
+    raw_html = fetch_article_html_direct(article_url)
+    if not extract_content_html(raw_html):
+        raise RuntimeError("未提取到正文 #js_content（可能链接失效）")
+    title = extract_meta(raw_html, "og:title") or ""
+    biz = extract_biz_from_html(raw_html)
+    mid = extract_mid_from_html(raw_html)
+    idx = extract_idx_from_html(raw_html)
+    comment_id = extract_comment_id_from_html(raw_html)
+
+    if not (biz and mid and comment_id):
+        return {"title": title, "comments": [], "total_count": 0, "note": "该文章未开启评论或无评论"}
+
+    cred = creds.get(biz)
+    if not cred or not cred.get("pass_ticket"):
+        return {"title": title, "comments": [], "total_count": 0, "biz": biz,
+                "note": "该公众号尚未采集凭证，请先到微信打开其一篇文章"}
+
+    all_comments = []
+    offset = 0
+    total = 0
+    while True:
+        params = {
+            "action": "getcomment", "scene": "0", "__biz": biz, "appmsgid": mid, "idx": idx,
+            "comment_id": comment_id, "offset": str(offset), "limit": "100",
+            "f": "json", "wxtoken": "777",
+            "uin": cred.get("uin", ""), "key": cred.get("key", ""),
+            "pass_ticket": cred.get("pass_ticket", ""),
+        }
+        resp = requests.get("https://mp.weixin.qq.com/mp/appmsg_comment", params=params,
+                            headers={"User-Agent": UA, "Referer": "https://mp.weixin.qq.com/"},
+                            timeout=30, verify=False)
+        data = resp.json()
+        br = data.get("base_resp", {}) or {}
+        if br.get("ret", 0) != 0:
+            raise RuntimeError(f"评论接口 ret={br.get('ret')}：{br.get('errmsg')}")
+        total = data.get("elected_comment_total_cnt", 0) or 0
+        batch = data.get("elected_comment", []) or []
+        for c in batch:
+            replies = []
+            reply_obj = c.get("reply", {}) or {}
+            for r in reply_obj.get("reply_list", []) or []:
+                replies.append({
+                    "nick": r.get("nick_name") or "",
+                    "content": r.get("content") or "",
+                    "time": r.get("create_time") or 0,
+                    "like": r.get("reply_like_num") or 0,
+                    "from_author": bool(r.get("reply_from_author")),
+                })
+            all_comments.append({
+                "nick": c.get("nick_name") or "",
+                "content": c.get("content") or "",
+                "time": c.get("create_time") or 0,
+                "like": c.get("like_num") or 0,
+                "elected": True,
+                "replies": replies,
+            })
+        if not batch or not data.get("continue_flag"):
+            break
+        offset += len(batch)
+        time.sleep(0.3)
+
+    return {"title": title, "comments": all_comments, "total_count": total, "biz": biz, "mid": mid}
 
 
 def reader_export_worker(task_id: str):
-    """单篇下载：按粘贴的链接逐篇抓正文，写多格式（免登录，仅正文）。"""
+    """读者模式导出：按粘贴的链接逐篇抓正文 + 精选评论，写多格式。"""
     task = TASKS[task_id]
     cfg = task["cfg"]
     try:
+        # 预置变量，确保中途停止时也能安全引用
+        urls = []
+        ok = 0
+        total_comments = 0
+        results = []  # 每个链接结果：{url, title, success, error}
+        out_dir = None
+        formats = set()
         urls = [u.strip() for u in (cfg.get("article_urls") or []) if u and u.strip()]
         if not urls:
             raise RuntimeError("请先粘贴文章链接")
+        creds = load_reader_credentials()
 
         formats = set()
         for f in (cfg.get("export_formats") or ["markdown"]):
@@ -2061,13 +2416,21 @@ def reader_export_worker(task_id: str):
         if not formats:
             formats = {"markdown"}
 
-        out_dir = Path(cfg.get("output_dir") or OUTPUT_ROOT) / f"单篇下载_{datetime.now().strftime('%Y-%m-%d')}"
+        layout = str(cfg.get("layout") or "subdir")
+        download_images = bool(cfg.get("download_images", True))
+
+        out_dir = Path(cfg.get("output_dir") or OUTPUT_ROOT) / f"读者导出_{datetime.now().strftime('%Y-%m-%d')}"
         out_dir.mkdir(parents=True, exist_ok=True)
         task_log(task, f"输出目录：{out_dir}")
         task_log(task, f"导出格式：{', '.join(sorted(formats))}，共 {len(urls)} 个链接")
+        task_log(task, f"布局：{'平铺到同一目录' if layout == 'flat' else '每篇一个子文件夹'}，"
+                       f"图片：{'下载' if download_images else '不下载'}")
 
-        ok = 0
         for i, url in enumerate(urls, 1):
+            _check_stop(task)  # 用户点「停止下载」后在此退出
+            title = f"文章{i}"
+            err_msg = ""
+            success = False
             try:
                 raw_html = fetch_article_html_direct(url)
                 content_html = extract_content_html(raw_html)
@@ -2083,15 +2446,34 @@ def reader_export_worker(task_id: str):
                     except Exception:
                         date = ""
                 fname = f"{date}_{safe}" if date else safe
-                article_dir = out_dir / fname
+                if layout == "flat":
+                    # 平铺：文件直接放 out_dir，图片放「文章文件名_files」
+                    article_dir = out_dir
+                    media_dir = out_dir / f"{fname}_files"
+                    rel_prefix = f"{fname}_files"
+                else:
+                    # 每篇一个子文件夹，图片放 images/
+                    article_dir = out_dir / fname
+                    media_dir = article_dir / "images"
+                    rel_prefix = "images"
                 article_dir.mkdir(parents=True, exist_ok=True)
                 task_log(task, f"[{i}/{len(urls)}] {title[:40]}")
-                content_html, img_count = localize_images(content_html, article_dir / "images", "images")
-                if img_count:
-                    task_log(task, f"    已下载 {img_count} 张图片")
+                if download_images:
+                    content_html, img_count = localize_images(content_html, media_dir, rel_prefix)
+                    if img_count:
+                        task_log(task, f"    已下载 {img_count} 张图片")
                 art = {"title": title, "body_md": html_to_markdown(content_html),
                        "content_url": url, "time": 0}
                 comments = None
+                if cfg.get("fetch_comments"):
+                    try:
+                        comments = fetch_reader_article_comments(url, creds)
+                        if comments.get("comments"):
+                            task_log(task, f"    已抓取 {len(comments['comments'])} 条精选评论")
+                        elif comments.get("note"):
+                            task_log(task, f"    {comments['note']}")
+                    except Exception as e:
+                        task_log(task, f"    [评论失败] {e}")
                 if "markdown" in formats:
                     (article_dir / f"{fname}.md").write_text(article_to_markdown(art, comments), encoding="utf-8")
                 if "html" in formats or "pdf" in formats:
@@ -2108,13 +2490,27 @@ def reader_export_worker(task_id: str):
                     if not export_html_to_pdf(html_path, pdf_path):
                         task_log(task, f"  [警告] PDF 转换失败（未检测到 Chrome/Edge）")
                 ok += 1
+                success = True
+                if comments:
+                    total_comments += len(comments.get("comments", []))
             except Exception as e:
+                err_msg = str(e)
                 task_log(task, f"  [失败] {url[:60]}：{e}")
+            results.append({"url": url, "title": title, "success": success, "error": err_msg})
+            task["results_sofar"] = list(results)  # 实时进度
             time.sleep(1.2)
 
-        task["result"] = {"ok": ok, "total": len(urls), "formats": sorted(formats), "dir": str(out_dir)}
+        task["result"] = {"ok": ok, "total": len(urls), "comments": total_comments,
+                          "formats": sorted(formats), "dir": str(out_dir), "results": results}
         task["status"] = "done"
-        task_log(task, f"完成：成功 {ok}/{len(urls)} 篇")
+        task_log(task, f"完成：成功 {ok}/{len(urls)} 篇，共 {total_comments} 条评论")
+    except TaskStopped:
+        task["status"] = "stopped"
+        task["result"] = {"ok": ok, "total": len(urls), "comments": total_comments,
+                          "formats": sorted(formats),
+                          "dir": str(out_dir) if out_dir else "",
+                          "results": results, "stopped": True}
+        task_log(task, "已停止下载（剩余链接保留在输入框，可再次点击下载继续）")
     except Exception as e:
         task["status"] = "error"
         task["error"] = str(e)
@@ -2194,17 +2590,24 @@ def fetch_articles_worker(tid):
     token = data.get("token", "")
     mp_cookie = data.get("mp_cookie", "")
     max_articles = int(data.get("max_articles", 0) or 0)
+    date_from = data.get("date_from", "")
+    date_to = data.get("date_to", "")
 
     def _on_page(arts):
         # 每拉完一页，把当前累计文章暴露给前端增量渲染
         task["articles_sofar"] = list(arts)
 
     try:
+        book_id = ""
+        mp_name = ""
+        if date_from or date_to:
+            task_log(task, f"时间范围：{date_from or '不限'} ~ {date_to or '不限'}")
         if token and mp_cookie:
             # 优先后台「原创」列表
             task_log(task, "使用公众号后台「原创」列表拉取文章 ...")
             articles, mp_name = fetch_all_articles_from_mp(
-                mp_cookie, token, task=task, max_articles=max_articles, on_page=_on_page)
+                mp_cookie, token, task=task, max_articles=max_articles, on_page=_on_page,
+                date_from=date_from, date_to=date_to)
             book_id = ""
             task_log(task, f"共 {len(articles)} 篇（原创）")
         else:
@@ -2213,24 +2616,24 @@ def fetch_articles_worker(tid):
             task_log(task, f"  bookId = {book_id}")
             task_log(task, "拉取全部文章列表 ...")
             articles, got_name = fetch_all_articles(cookie, book_id, task=task,
-                                                    max_articles=max_articles, on_page=_on_page)
+                                                    max_articles=max_articles, on_page=_on_page,
+                                                    date_from=date_from, date_to=date_to)
             if not mp_name and got_name:
                 mp_name = got_name
-            # 拉完列表后提取每篇的短链（og:url），存到 article['url']，并保存到 output 目录 txt
-            if articles and cookie:
-                task_log(task, "提取文章短链（og:url）...")
-                threads = int(data.get("threads", 0) or 4)
-                short_file = save_short_urls_file(articles, mp_name)  # 先建初始文件（可能为空）
-                articles = attach_short_urls(cookie, articles, task=task, threads=threads,
-                                             save_path=short_file)
-                save_short_urls_file(articles, mp_name, path=short_file)  # 结束后最终完整写一次
-                task_log(task, f"短链已保存：{short_file}")
         CACHE["articles"] = articles
         CACHE["book_id"] = book_id
         CACHE["mp_name"] = mp_name
         task["result"] = {"articles": articles, "book_id": book_id, "mp_name": mp_name}
         task["status"] = "done"
         task_log(task, f"拉取完成：共 {len(articles)} 篇文章" + (f"（{mp_name}）" if mp_name else ""))
+    except TaskStopped:
+        # 停止时保留已解析到的 bookId/mp_name，避免导出文件夹退化成「article」
+        CACHE["book_id"] = book_id or CACHE.get("book_id", "")
+        CACHE["mp_name"] = mp_name or CACHE.get("mp_name", "")
+        task["status"] = "stopped"
+        task["result"] = {"articles": task.get("articles_sofar") or [],
+                          "book_id": book_id, "mp_name": mp_name}
+        task_log(task, "已停止拉取")
     except Exception as e:
         task["status"] = "error"
         task["error"] = str(e)
@@ -2242,9 +2645,21 @@ def api_articles():
     data = request.get_json(force=True) or {}
     tid = new_task_id()
     with TASKS_LOCK:
-        TASKS[tid] = {"status": "running", "log": [], "result": None, "error": None, "cfg": data}
+        TASKS[tid] = {"status": "running", "log": [], "result": None, "error": None,
+                      "cfg": data, "stop": False}
     threading.Thread(target=fetch_articles_worker, args=(tid,), daemon=True).start()
     return jsonify({"ok": True, "task_id": tid})
+
+
+@app.route("/api/articles/stop", methods=["POST"])
+def api_articles_stop():
+    data = request.get_json(force=True) or {}
+    tid = data.get("task_id") or ""
+    task = TASKS.get(tid)
+    if not task:
+        return jsonify({"ok": False, "error": "任务不存在"})
+    task["stop"] = True
+    return jsonify({"ok": True})
 
 
 @app.route("/api/comments", methods=["POST"])
@@ -2277,9 +2692,21 @@ def api_export():
     data = request.get_json(force=True) or {}
     tid = new_task_id()
     with TASKS_LOCK:
-        TASKS[tid] = {"status": "running", "log": [], "result": None, "error": None, "cfg": data}
+        TASKS[tid] = {"status": "running", "log": [], "result": None, "error": None,
+                      "cfg": data, "stop": False}
     threading.Thread(target=export_worker, args=(tid,), daemon=True).start()
     return jsonify({"ok": True, "task_id": tid})
+
+
+@app.route("/api/export/stop", methods=["POST"])
+def api_export_stop():
+    data = request.get_json(force=True) or {}
+    tid = data.get("task_id") or ""
+    task = TASKS.get(tid)
+    if not task:
+        return jsonify({"ok": False, "error": "任务不存在"})
+    task["stop"] = True
+    return jsonify({"ok": True})
 
 
 @app.route("/api/task/<tid>")
@@ -2289,7 +2716,63 @@ def api_task(tid):
         return jsonify({"ok": False, "error": "任务不存在"})
     return jsonify({"ok": True, "status": task["status"], "log": task["log"],
                     "result": task["result"], "error": task["error"],
-                    "articles_sofar": task.get("articles_sofar", [])})
+                    "articles_sofar": task.get("articles_sofar", []),
+                    "results_sofar": task.get("results_sofar", [])})
+
+
+@app.route("/api/reader_capture/start", methods=["POST"])
+def api_reader_capture_start():
+    ok, msg = start_reader_capture()
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/api/reader_capture/stop", methods=["POST"])
+def api_reader_capture_stop():
+    ok, msg = stop_reader_capture()
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/api/reader_capture/status")
+def api_reader_capture_status():
+    return jsonify(_reader_capture_status())
+
+
+@app.route("/api/reader/articles", methods=["POST"])
+def api_reader_articles():
+    """根据文章链接列表，抓取每篇的标题 + 发布时间，供「拉取文章列表」预览。"""
+    data = request.get_json(force=True) or {}
+    urls = [u.strip() for u in (data.get("article_urls") or []) if u and u.strip()]
+    articles = []
+    for i, url in enumerate(urls):
+        item = {"url": url, "idx": i, "title": f"文章{i + 1}", "time": 0}
+        try:
+            raw_html = fetch_article_html_direct(url)
+            title = extract_meta(raw_html, "og:title") or ""
+            if title:
+                item["title"] = title
+            item["time"] = extract_publish_time(raw_html)
+        except Exception as e:
+            item["title"] = f"（抓取失败）{url[:40]}"
+            item["error"] = str(e)
+        articles.append(item)
+        time.sleep(0.3)
+    return jsonify({"ok": True, "articles": articles})
+
+
+@app.route("/api/reader/mp_articles", methods=["POST"])
+def api_reader_mp_articles():
+    """载入勾选公众号在本次采集中打开的文章列表。"""
+    data = request.get_json(force=True) or {}
+    bizes = [b for b in (data.get("biz_list") or []) if b]
+    if not bizes:
+        return jsonify({"ok": False, "error": "请先勾选公众号"})
+    creds = load_reader_credentials()
+    arts = load_reader_articles()
+    biz_set = set(bizes)
+    articles = [{"title": a.get("title") or a.get("url", ""), "url": a.get("url", ""), "time": 0}
+                for a in arts if a.get("biz") in biz_set and a.get("url")]
+    names = [(creds.get(b) or {}).get("name") or b for b in bizes]
+    return jsonify({"ok": True, "articles": articles, "names": names})
 
 
 @app.route("/api/reader_export", methods=["POST"])
@@ -2297,9 +2780,21 @@ def api_reader_export():
     data = request.get_json(force=True) or {}
     tid = new_task_id()
     with TASKS_LOCK:
-        TASKS[tid] = {"status": "running", "log": [], "result": None, "error": None, "cfg": data}
+        TASKS[tid] = {"status": "running", "log": [], "result": None, "error": None,
+                      "cfg": data, "stop": False}
     threading.Thread(target=reader_export_worker, args=(tid,), daemon=True).start()
     return jsonify({"ok": True, "task_id": tid})
+
+
+@app.route("/api/reader_export/stop", methods=["POST"])
+def api_reader_export_stop():
+    data = request.get_json(force=True) or {}
+    tid = data.get("task_id") or ""
+    task = TASKS.get(tid)
+    if not task:
+        return jsonify({"ok": False, "error": "任务不存在"})
+    task["stop"] = True
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":

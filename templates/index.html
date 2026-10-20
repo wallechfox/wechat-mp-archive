@@ -18,7 +18,7 @@
   header h1 { font-size: 17px; margin: 0; font-weight: 600; }
   header .sub { color: var(--muted); font-size: 12px; }
   .wrap { max-width: 1280px; margin: 0 auto; padding: 20px; display: grid;
-          grid-template-columns: 360px 1fr; gap: 20px; align-items: start; }
+         grid-template-columns: 480px 1fr; gap: 20px; align-items: start; }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
           padding: 16px; margin-bottom: 16px; }
   .card h2 { font-size: 14px; margin: 0 0 12px; font-weight: 600; }
@@ -41,6 +41,8 @@
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
   th { color: var(--muted); font-weight: 500; font-size: 12px; background: #fafbfc; }
   td.title { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  tr.failed-row td { background: #fdecec; }
+  tr.failed-row td.title { color: var(--err); }
   .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px;
          background: #eef1f5; color: var(--muted); }
   .tag.ok { background: #e8f7ee; color: var(--ok); }
@@ -81,6 +83,17 @@
                border-radius: 6px; padding: 8px 10px; line-height: 1.6; }
   .ro-field { background: #fafbfc; border: 1px solid var(--border); border-radius: 6px;
               padding: 8px 10px; font-size: 13px; min-height: 18px; }
+  .step-line { display: flex; gap: 8px; margin-bottom: 8px; font-size: 12px; color: var(--muted); align-items: flex-start; }
+  .step-num { background: var(--primary); color: #fff; border-radius: 50%; width: 18px; height: 18px;
+              display: inline-flex; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0; margin-top: 1px; }
+  .capture-status { font-size: 12px; padding: 8px 10px; border-radius: 6px; margin-top: 8px; line-height: 1.6; }
+  .capture-status.running { background: #fff7e6; color: var(--warn); }
+  .capture-status.ready { background: #e8f7ee; color: var(--ok); }
+  .reader-cred { display: flex; align-items: center; gap: 6px; padding: 3px 0;
+                 cursor: pointer; font-size: 13px; }
+  .reader-cred input[type="checkbox"] { width: auto; padding: 0; border: none;
+                 border-radius: 0; accent-color: var(--primary); margin: 0; flex-shrink: 0; }
+  .reader-cred .cnt { color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -132,8 +145,17 @@
         <label>当前公众号（扫码登录后自动识别）</label>
         <div class="ro-field" id="mpNameDisplay">（未识别，请先扫码登录公众号后台）</div>
       </div>
-      <div class="row">
-        <button class="btn" onclick="doFetchArticles()">拉取文章列表</button>
+      <div class="field">
+        <label>时间范围（可选，留空表示全部；只填起始日期可做增量拉取）</label>
+        <div class="row">
+          <input type="date" id="date_from1" style="width:auto;flex:1;min-width:120px">
+          <span class="muted">至</span>
+          <input type="date" id="date_to1" style="width:auto;flex:1;min-width:120px">
+        </div>
+      </div>
+      <div class="row" style="justify-content:flex-end">
+        <button class="btn" data-fetch-btn onclick="doFetchArticles()">拉取文章列表</button>
+        <button class="btn ghost" data-stop-btn onclick="stopFetch()" style="display:none">停止拉取</button>
       </div>
     </div>
     </div><!-- /panel1 -->
@@ -157,8 +179,17 @@
           <label>公众号名称 / 链接 / __biz / MP_WXS_xxx，也可直接粘贴该公众号的任意一篇文章地址</label>
           <input id="keyword" placeholder="例如：公众号名称，或 https://mp.weixin.qq.com/s/xxxx">
         </div>
-        <div class="row">
-          <button class="btn" onclick="doFetchArticles()">拉取文章列表</button>
+        <div class="field">
+          <label>时间范围（可选，留空表示全部；只填起始日期可做增量拉取）</label>
+          <div class="row">
+            <input type="date" id="date_from2" style="width:auto;flex:1;min-width:120px">
+            <span class="muted">至</span>
+            <input type="date" id="date_to2" style="width:auto;flex:1;min-width:120px">
+          </div>
+        </div>
+        <div class="row" style="justify-content:flex-end">
+          <button class="btn" data-fetch-btn onclick="doFetchArticles()">拉取文章列表</button>
+          <button class="btn ghost" data-stop-btn onclick="stopFetch()" style="display:none">停止拉取</button>
         </div>
         <div class="mt muted" id="resolveResult"></div>
       </div>
@@ -172,11 +203,16 @@
           <label>每行一个文章链接，支持多行一次下载多篇</label>
           <textarea id="reader_urls3" placeholder="https://mp.weixin.qq.com/s/xxxx&#10;https://mp.weixin.qq.com/s/yyyy" style="min-height:52px"></textarea>
         </div>
-        <div class="tip" style="margin-bottom:8px">直接访问文章链接抓取正文，不抓评论，无需登录或任何凭证；可多行粘贴，一次下载多篇。</div>
-        <div class="row">
-          <button class="btn green" onclick="doReaderExportSingle()">下载文章</button>
+        <div class="tip" style="margin-bottom:8px">粘贴文章链接后点「导入下载列表」，链接会加入右侧列表；再在列表中勾选并点「下载选中」开始下载。直接访问链接抓取正文，不抓评论，无需登录或任何凭证。</div>
+        <div class="row" style="justify-content:flex-end">
+          <button class="btn green" id="btnReaderImport" onclick="importReaderList()">导入下载列表</button>
         </div>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>运行日志</h2>
+      <div class="log" id="log">等待操作……</div>
     </div>
 
   </div>
@@ -220,21 +256,13 @@
         <span class="spacer"></span>
         <button class="btn small ghost" onclick="selectAll()">全选</button>
         <button class="btn small ghost" onclick="selectInvert()">反选</button>
-        <button class="btn small green" onclick="doDownloadSelected()">下载选中</button>
-        <label class="row" id="fThreads" style="cursor:pointer;margin:0;display:flex;gap:4px;font-size:12px;align-items:center">线程
-          <select id="threads" style="padding:2px 4px">
-            <option value="1">1</option>
-            <option value="2">2</option>
-            <option value="4" selected>4</option>
-            <option value="8">8</option>
-            <option value="16">16</option>
-          </select>
-        </label>
+        <button class="btn small green" id="btnDownload" onclick="doDownloadSelected()">下载选中</button>
+        <button class="btn small ghost" id="btnStopExport" onclick="stopExport()" style="display:none">停止下载</button>
       </div>
       <div class="mt" style="overflow-x:auto">
         <table>
-          <thead><tr><th style="width:30px"><input type="checkbox" id="checkAll" onclick="toggleAll(this)"></th><th>#</th><th>标题</th><th>时间</th><th>阅读/点赞</th><th>评论</th><th>操作</th></tr></thead>
-          <tbody id="articleBody"><tr><td colspan="7" class="muted">尚未拉取，请先在左侧「拉取文章列表」</td></tr></tbody>
+          <thead><tr><th style="width:30px"><input type="checkbox" id="checkAll" onclick="toggleAll(this)"></th><th>#</th><th>标题</th><th>时间</th></tr></thead>
+          <tbody id="articleBody"><tr><td colspan="4" class="muted">尚未拉取，请先在左侧「拉取文章列表」</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -244,10 +272,6 @@
       <div id="commentDetail"></div>
     </div>
 
-    <div class="card">
-      <h2>运行日志</h2>
-      <div class="log" id="log">等待操作……</div>
-    </div>
   </div>
 </div>
 
@@ -272,6 +296,16 @@ let qrKind = '';
 let currentBookId = '';
 let currentMpName = '';
 let currentMode = '1';
+let fetchTaskId = null;   // 当前拉取任务 id（用于停止）
+let fetching = false;     // 是否正在拉取文章列表
+let exportTaskId = null;  // 当前下载任务 id（用于停止）
+let activeExportKind = 'main';  // 当前下载任务类型：main（模式1/2 走 /api/export）、reader（模式3 走 /api/reader_export）
+let exportSuccess = 0;    // 当前列表累计下载成功的篇数
+let uidSeq = 0;           // 文章唯一标识序号（用于导出后匹配成功/失败）
+
+function ensureUids(){
+  articlesCache.forEach(a => { if(a.uid == null) a.uid = 'a' + (++uidSeq); });
+}
 
 function $(id){ return document.getElementById(id); }
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -288,6 +322,36 @@ function setStatus(text, state){
   $('statusBar').innerHTML = `<span class="status-dot ${state}"></span>${esc(text)}`;
 }
 
+// 拉取过程中：禁用「拉取文章列表」和「下载选中」，显示「停止拉取」；结束后恢复
+function setFetching(on){
+  fetching = on;
+  const dl = $('btnDownload');
+  if(dl) dl.disabled = on;
+  document.querySelectorAll('button[data-fetch-btn]').forEach(b => b.disabled = on);
+  document.querySelectorAll('button[data-stop-btn]').forEach(b => b.style.display = on ? '' : 'none');
+  if(!on) fetchTaskId = null;
+}
+
+// 下载过程中：禁用「下载选中」（变灰）和「拉取文章列表」，显示「停止下载」；结束后恢复
+function setExporting(on){
+  const dl = $('btnDownload');
+  if(dl) dl.disabled = on;
+  document.querySelectorAll('button[data-fetch-btn]').forEach(b => b.disabled = on);
+  const stop = $('btnStopExport');
+  if(stop) stop.style.display = on ? '' : 'none';
+  if(!on){ exportTaskId = null; activeExportKind = 'main'; }
+}
+
+async function stopExport(){
+  if(!exportTaskId){ log('当前没有正在下载的任务', 'err'); return; }
+  // 模式3 用 /api/reader_export/stop，模式1/2 用 /api/export/stop
+  const url = (activeExportKind === 'reader') ? '/api/reader_export/stop' : '/api/export/stop';
+  try {
+    await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({task_id: exportTaskId})});
+  } catch(e){}
+  log('已请求停止下载，等待当前文章结束后恢复……');
+}
+
 function gather(){
   return {
     weread_cookie: ($('weread_cookie') ? $('weread_cookie').value : '').trim(),
@@ -301,7 +365,9 @@ function gather(){
     export_formats: [...document.querySelectorAll('input.fmt:checked')].map(e => e.value),
     layout: (document.querySelector('input[name="layout"]:checked') || {}).value || 'subdir',
     download_images: ($('download_images') ? $('download_images').checked : true),
-    threads: parseInt(($('threads') ? $('threads').value : '4'), 10) || 4,
+    // 时间范围：模式1 用 date_from1/date_to1，模式2 用 date_from2/date_to2
+    date_from: (currentMode === '2' ? ($('date_from2') ? $('date_from2').value : '') : ($('date_from1') ? $('date_from1').value : '')),
+    date_to: (currentMode === '2' ? ($('date_to2') ? $('date_to2').value : '') : ($('date_to1') ? $('date_to1').value : '')),
   };
 }
 
@@ -327,7 +393,6 @@ async function loadConfig(){
     if(rb) rb.checked = true;
   }
   if(c.download_images !== undefined && $('download_images')) $('download_images').checked = !!c.download_images;
-  if(c.threads && $('threads')) $('threads').value = String(c.threads);
   if(c.mp_name){ currentMpName = c.mp_name; }
   updateMpNameDisplay();
   log('配置已读取', 'ok');
@@ -337,10 +402,24 @@ async function doFetchArticles(){
   const body = gather();
   log('开始拉取文章列表，公众号文章较多时可能需要 10~30 秒，进度见下方日志……');
   setStatus('拉取文章中', 'running');
+  setFetching(true);
+  // 重新拉取：清空旧列表并重置下载统计
+  articlesCache = [];
+  exportSuccess = 0;
+  renderArticles();
   const r = await fetch('/api/articles', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const d = await r.json();
-  if(!d.ok){ setStatus('就绪', 'done'); log(`拉取失败：${d.error}`, 'err'); return; }
+  if(!d.ok){ setStatus('就绪', 'done'); setFetching(false); log(`拉取失败：${d.error}`, 'err'); return; }
+  fetchTaskId = d.task_id;
   pollFetchTask(d.task_id);
+}
+
+async function stopFetch(){
+  if(!fetchTaskId){ log('当前没有正在拉取的任务', 'err'); return; }
+  try {
+    await fetch('/api/articles/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({task_id: fetchTaskId})});
+  } catch(e){}
+  log('已请求停止拉取，等待当前步骤结束后恢复按钮……');
 }
 
 function pollFetchTask(tid){
@@ -364,6 +443,7 @@ function pollFetchTask(tid){
     if(d.status === 'done'){
       clearInterval(taskTimer);
       setStatus('就绪', 'done');
+      setFetching(false);
       const res = d.result || {};
       articlesCache = res.articles || [];
       currentBookId = res.book_id || '';
@@ -373,9 +453,16 @@ function pollFetchTask(tid){
       const rr = $('resolveResult');
       if(rr) rr.innerHTML = `✅ 当前公众号：<code>${esc(currentMpName || currentBookId)}</code>`;
       log(`拉取成功：共 ${articlesCache.length} 篇文章${currentMpName?'（'+currentMpName+'）':''}`, 'ok');
+    } else if(d.status === 'stopped'){
+      clearInterval(taskTimer);
+      setStatus('就绪', 'done');
+      setFetching(false);
+      // 保留已拉到并渲染的部分文章列表
+      log(`已停止拉取，已加载 ${articlesCache.length} 篇文章`, 'warn');
     } else if(d.status === 'error'){
       clearInterval(taskTimer);
       setStatus('失败', 'error');
+      setFetching(false);
       log(`拉取失败：${d.error}`, 'err');
     }
   }, 800);
@@ -387,24 +474,40 @@ function fmtTime(ts){
   return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
 }
 
-function renderArticles(){
-  $('articleCount').textContent = `（共 ${articlesCache.length} 篇）`;
+// 列表统计：共 X 篇（原始总数），下载成功 Y 篇，失败 Z 篇；下载过程中实时刷新
+function renderArticleStats(){
+  const el = $('articleCount');
+  if(!el) return;
+  const failed = articlesCache.filter(a => a._failed).length;
+  const total = articlesCache.length + exportSuccess;  // 原始总数 = 剩余 + 已成功移除
+  el.textContent = `共 ${total} 篇，下载成功 ${exportSuccess} 篇，失败 ${failed} 篇`;
+}
+
+function renderArticles(checkedUids){
+  ensureUids();
+  renderArticleStats();
   const tb = $('articleBody');
   if(!articlesCache.length){
-    tb.innerHTML = '<tr><td colspan="7" class="muted">暂无文章</td></tr>';
+    const tip = (currentMode === '3')
+      ? '暂无链接，请先在左侧粘贴文章链接并点「导入下载列表」'
+      : '尚未拉取，请先在左侧「拉取文章列表」';
+    tb.innerHTML = `<tr><td colspan="4" class="muted">${tip}</td></tr>`;
     const ca = $('checkAll'); if(ca) ca.checked = false;
     return;
   }
   tb.innerHTML = articlesCache.map((a,i)=>`
-    <tr>
+    <tr class="${a._failed ? 'failed-row' : ''}">
       <td><input type="checkbox" class="rowCheck" data-i="${i}" checked></td>
       <td>${i+1}</td>
-      <td class="title" title="${esc(a.title)}">${esc(a.title)}</td>
+      <td class="title" title="${esc(a.title)}">${a._failed ? '<span class="tag err">失败</span> ' : ''}${esc(a.title)}</td>
       <td>${fmtTime(a.time)}</td>
-      <td>${a.read_num||0}/${a.like_num||0}</td>
-      <td><span class="tag">-</span></td>
-      <td><button class="btn small ghost" onclick="showArticle(${i})">预览</button></td>
     </tr>`).join('');
+  if(checkedUids){
+    document.querySelectorAll('input.rowCheck').forEach(cb => {
+      const a = articlesCache[parseInt(cb.dataset.i)];
+      if(a) cb.checked = checkedUids.has(a.uid);
+    });
+  }
   updateCheckAll();
 }
 
@@ -433,6 +536,17 @@ function toggleAll(cb){
   document.querySelectorAll('input.rowCheck').forEach(e => e.checked = cb.checked);
 }
 
+// 重新渲染列表并保持当前勾选状态
+function renderKeepChecked(){
+  const checked = new Set(getSelectedArticles().map(a => a.uid));
+  renderArticles();
+  document.querySelectorAll('input.rowCheck').forEach(cb => {
+    const a = articlesCache[parseInt(cb.dataset.i)];
+    if(a) cb.checked = checked.has(a.uid);
+  });
+  updateCheckAll();
+}
+
 async function showArticle(i){
   const a = articlesCache[i];
   if(!a) return;
@@ -443,6 +557,23 @@ async function showArticle(i){
     <div class="muted" style="margin-bottom:8px">${esc(a.title)}</div>
     <div class="tip">${esc(a.summary || '（无摘要）')}</div>
     <div class="mt muted">正文内容将在「开始导出」时抓取，按所选格式（Markdown / HTML / TXT / PDF）写入文件。</div>`;
+}
+
+async function doFetchComments(){
+  const body = gather();
+  if(!body.token || !body.fingerprint){ log('请先填写 token 和 fingerprint', 'err'); return; }
+  log('拉取评论中（每篇文章依次请求，可能较慢）……');
+  setStatus('拉取评论中', 'running');
+  const r = await fetch('/api/comments', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  setStatus('就绪', 'done');
+  if(d.ok){
+    const list = d.articles || [];
+    renderComments(list);
+    log(`评论拉取完成：共 ${list.length} 篇文章有评论`, 'ok');
+  } else {
+    log(`评论拉取失败：${d.error}`, 'err');
+  }
 }
 
 function renderComments(list){
@@ -467,7 +598,7 @@ function renderComments(list){
   $('commentDetail').innerHTML = html || '<div class="muted">暂无评论数据</div>';
 }
 
-function pollTask(tid){
+function pollTask(tid, onDone, onProgress, onFinish){
   clearInterval(taskTimer);
   let rendered = 0;  // 已渲染的后端日志条数，只追加新增，避免重复显示
   const el = $('log');
@@ -478,16 +609,126 @@ function pollTask(tid){
     for(let i=rendered;i<logs.length;i++){ const div=document.createElement('div'); div.textContent=logs[i]; el.appendChild(div); }
     rendered = logs.length;
     el.scrollTop = el.scrollHeight;
+    // 实时进度：边下载边更新列表（成功移除、失败标红）
+    if(onProgress) onProgress(d.results_sofar || []);
     if(d.status === 'done'){
       clearInterval(taskTimer);
       setStatus('完成', 'done');
       log(d.result ? `✅ 导出完成：成功 ${d.result.ok}/${d.result.total} 篇，共 ${d.result.comments} 条评论，目录 ${d.result.dir}` : '✅ 完成', 'ok');
+      if(onDone) onDone(d.result || {});
+      if(onFinish) onFinish();
+    } else if(d.status === 'stopped'){
+      clearInterval(taskTimer);
+      setStatus('就绪', 'done');
+      log('已停止下载', 'warn');
+      if(onDone) onDone(d.result || {});
+      if(onFinish) onFinish();
     } else if(d.status === 'error'){
       clearInterval(taskTimer);
       setStatus('失败', 'error');
       log(`❌ ${d.error}`, 'err');
+      if(onFinish) onFinish();
     }
   }, 800);
+}
+
+// 选择性导出完成后：成功的从列表移除，失败的保留并自动勾选，方便再次下载
+function handleSelectedExportResult(res){
+  const results = res.results || [];
+  if(!results.length) return;
+  const byUid = {};
+  results.forEach(r => { if(r.uid != null) byUid[r.uid] = r; });
+  // 记录导出前的选中状态（此时 DOM 仍是导出前的列表）
+  const selectedUids = new Set(getSelectedArticles().map(a => a.uid));
+  let removed = 0;
+  articlesCache = articlesCache.filter(a => {
+    const r = byUid[a.uid];
+    if(r && r.success){ removed++; return false; }  // 成功：从列表移除
+    return true;
+  });
+  exportSuccess += removed;  // 计入成功数（若实时进度已移除过则为 0，不会重复计数）
+  // 标记失败项（仅更新本次下载涉及的，保留其它文章原有的失败标记）
+  articlesCache.forEach(a => {
+    const r = byUid[a.uid];
+    if(r) a._failed = !r.success;
+  });
+  // 恢复勾选：原来选中的保持勾选（失败的因此仍选中），未选中的保持未选
+  const failedUids = new Set(results.filter(r => !r.success && r.uid != null).map(r => r.uid));
+  renderArticles(new Set([...selectedUids, ...failedUids]));
+  const failed = results.filter(r => !r.success).length;
+  log(`已移除 ${removed} 篇成功文章，列表剩余 ${articlesCache.length} 篇；失败 ${failed} 篇已保留并勾选，可直接再次下载`, failed ? 'warn' : 'ok');
+}
+
+// 下载过程中的实时列表更新：成功项立即移除，失败项标红
+function handleExportProgress(results){
+  if(!results || !results.length) return;
+  const checkedUids = new Set(getSelectedArticles().map(a => a.uid));
+  let changed = false;
+  results.forEach(r => {
+    if(r.uid == null) return;
+    const idx = articlesCache.findIndex(a => a.uid === r.uid);
+    if(idx < 0) return;
+    if(r.success){
+      articlesCache.splice(idx, 1);  // 成功：实时从列表移除
+      exportSuccess++;
+      changed = true;
+    } else if(!articlesCache[idx]._failed){
+      articlesCache[idx]._failed = true;  // 失败：实时标红
+      changed = true;
+    }
+  });
+  if(changed) renderArticles(checkedUids);
+}
+
+// 模式3 下载过程中：按 url 匹配列表项，成功实时移除、失败标红
+function handleReaderProgress(results){
+  if(!results || !results.length) return;
+  const checkedUids = new Set(getSelectedArticles().map(a => a.uid));
+  let changed = false;
+  results.forEach(r => {
+    if(!r.url) return;
+    const idx = articlesCache.findIndex(a => a.url === r.url);
+    if(idx < 0) return;
+    if(r.success){
+      articlesCache.splice(idx, 1);
+      exportSuccess++;
+      changed = true;
+    } else if(!articlesCache[idx]._failed){
+      articlesCache[idx]._failed = true;
+      changed = true;
+    }
+  });
+  if(changed) renderArticles(checkedUids);
+}
+
+// 模式3 下载完成后：成功的移除，失败/未完成的保留在列表并勾选，可再次点「下载选中」
+function handleReaderSelectedResult(res){
+  const results = res.results || [];
+  if(!results.length) return;
+  const byUrl = {};
+  results.forEach(r => { if(r.url) byUrl[r.url] = r; });
+  const checkedUids = new Set(getSelectedArticles().map(a => a.uid));
+  let removed = 0, failed = 0;
+  articlesCache = articlesCache.filter(a => {
+    const r = byUrl[a.url];
+    if(r && r.success){ removed++; return false; }  // 成功：从列表移除
+    if(r && !r.success) failed++;
+    return true;
+  });
+  exportSuccess += removed;
+  articlesCache.forEach(a => {
+    const r = byUrl[a.url];
+    if(r) a._failed = !r.success;
+  });
+  renderArticles(checkedUids);
+  const remaining = articlesCache.length;
+  if(res.stopped){
+    log(`已停止下载：成功 ${removed} 篇，列表剩余 ${remaining} 条已勾选，可再次点「下载选中」继续`, 'warn');
+  } else if(failed){
+    log(`成功 ${removed} 篇，失败 ${failed} 篇；失败项已保留并勾选，可再次下载`, 'warn');
+  } else {
+    log(`全部 ${removed} 篇下载成功`, 'ok');
+  }
 }
 
 async function doExport(){
@@ -506,6 +747,7 @@ async function doExport(){
 }
 
 async function doExportSelected(){
+  ensureUids();
   const selected = getSelectedArticles();
   if(!selected.length){ log('请先在文章列表中勾选要下载的文章', 'err'); return; }
   const body = gather();
@@ -514,12 +756,21 @@ async function doExportSelected(){
   body.articles = selected;
   body.book_id = currentBookId;
   body.mp_name = currentMpName;
+  // 重试前清掉旧的失败标记（成功后会被移除，失败会重新标红）
+  selected.forEach(a => { a._failed = false; });
+  renderArticles(new Set(selected.map(a => a.uid)));
   log(`开始导出选中的 ${selected.length} 篇文章……`);
   setStatus('导出中', 'running');
+  setExporting(true);
   const r = await fetch('/api/export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const d = await r.json();
-  if(d.ok) pollTask(d.task_id);
-  else log(`启动失败：${d.error}`, 'err');
+  if(d.ok){
+    exportTaskId = d.task_id;
+    pollTask(d.task_id, handleSelectedExportResult, handleExportProgress, () => setExporting(false));
+  } else {
+    setExporting(false);
+    log(`启动失败：${d.error}`, 'err');
+  }
 }
 
 const MODE_PANEL = {1:'1', 2:'3', 3:'4'};
@@ -541,7 +792,6 @@ function switchMode(mode){
   const desc = $('modeDesc');
   if(desc) desc.textContent = MODE_DESC[mode] || '';
   // 「导出评论」仅模式1（我的号）显示
-  const isA = (mode === '1');
   const showComments = (mode === '1');
   const vis = {fFetchComments: showComments};
   Object.keys(vis).forEach(id => {
@@ -551,14 +801,13 @@ function switchMode(mode){
   // 切换模式时清空文章列表（不同模式的数据相互独立）
   currentMode = mode;
   articlesCache = [];
+  exportSuccess = 0;
   renderArticles();
-  // 模式1 拉列表为串行分页，不显示线程选择；模式2/3 保留（用于短链提取/下载并发）
-  const ft = $('fThreads');
-  if(ft) ft.style.display = isA ? 'none' : '';
 }
 
 function doDownloadSelected(){
-  // 模式1（我的号·后台）和模式2（微信读书整号）都走 /api/export 导出选中文章
+  // 模式3（链接直抓）按列表中的链接走 /api/reader_export；模式1/2 走 /api/export
+  if(currentMode === '3') return doReaderExportSelected();
   return doExportSelected();
 }
 
@@ -567,20 +816,102 @@ function updateMpNameDisplay(){
   if(el) el.textContent = currentMpName || '（未识别，请先扫码登录公众号后台）';
 }
 
-async function doReaderExportSingle(){
-  const urls = ($('reader_urls3').value || '').split('\n').map(s=>s.trim()).filter(Boolean);
-  if(!urls.length){ log('请先粘贴文章链接', 'err'); return; }
+// 模式3：把输入框中的链接导入右侧下载列表（去重），再在列表中勾选下载
+function importReaderList(){
+  const ta = $('reader_urls3');
+  const lines = (ta ? ta.value : '').split('\n').map(s => s.trim()).filter(Boolean);
+  if(!lines.length){ log('请先粘贴文章链接（每行一个）', 'err'); return; }
+  const exists = new Set(articlesCache.map(a => a.url));
+  const added = [];
+  let skipped = 0;
+  lines.forEach(line => {
+    const m = line.match(/https?:\/\/[^\s'"<>]+/);
+    if(!m){ skipped++; return; }
+    const url = m[0].replace(/[）)\]】》，,。;；、]+$/, '');
+    if(!/^https?:\/\/mp\.weixin\.qq\.com\//i.test(url)){ skipped++; return; }
+    if(exists.has(url)){ skipped++; return; }
+    exists.add(url);
+    added.push({url, title: url, time: 0});  // 标题先占位，随后异步抓取真实标题
+  });
+  if(!added.length){
+    log(`没有可导入的新链接（跳过 ${skipped} 条无效或重复）`, 'err');
+    return;
+  }
+  const keepChecked = new Set(getSelectedArticles().map(a => a.uid));
+  added.forEach(a => articlesCache.push(a));
+  ensureUids();
+  added.forEach(a => keepChecked.add(a.uid));
+  renderArticles();
+  // 恢复原有勾选状态：新增项默认勾选，之前手动取消的保持未选
+  document.querySelectorAll('input.rowCheck').forEach(cb => {
+    const a = articlesCache[parseInt(cb.dataset.i)];
+    if(a) cb.checked = keepChecked.has(a.uid);
+  });
+  updateCheckAll();
+  if(ta) ta.value = '';
+  log(`已导入 ${added.length} 条链接${skipped ? `，跳过 ${skipped} 条无效或重复` : ''}；在列表中勾选后点「下载选中」开始下载`, 'ok');
+  fetchReaderTitles(added);
+}
+
+// 异步补齐列表标题（失败不影响下载）
+async function fetchReaderTitles(items){
+  const urls = items.map(a => a.url);
+  if(!urls.length) return;
+  log(`正在抓取 ${urls.length} 条链接的标题……`);
+  try {
+    const r = await fetch('/api/reader/articles', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({article_urls: urls})});
+    const d = await r.json();
+    if(!d.ok){ log(`标题抓取失败：${d.error || '未知错误'}`, 'warn'); return; }
+    let failed = 0;
+    (d.articles || []).forEach(it => {
+      const a = articlesCache.find(x => x.url === it.url);
+      if(!a) return;
+      if(it.error){
+        failed++;
+        a.title = `（标题抓取失败）${a.url.slice(-18)}`;
+      } else if(it.title){
+        a.title = it.title;
+      }
+      if(it.time) a.time = it.time;
+    });
+    renderKeepChecked();
+    log(failed ? `标题已补齐，其中 ${failed} 条抓取失败（仍可尝试下载）` : '标题已补齐', failed ? 'warn' : 'ok');
+  } catch(e){
+    log(`标题抓取失败：${e}`, 'warn');
+  }
+}
+
+// 模式3：下载列表中勾选的链接
+async function doReaderExportSelected(){
+  ensureUids();
+  const selected = getSelectedArticles();
+  if(!selected.length){ log('请先在文章列表中勾选要下载的文章', 'err'); return; }
+  const urls = selected.map(a => a.url).filter(u => u && /^https?:\/\//i.test(u));
+  if(!urls.length){ log('选中的条目没有可下载的文章链接', 'err'); return; }
+  const g = gather();
   const body = {
     article_urls: urls,
     fetch_comments: false,
     export_formats: [...document.querySelectorAll('input.fmt:checked')].map(e => e.value),
+    output_dir: g.output_dir,
+    download_images: g.download_images,
+    layout: g.layout,
   };
-  log(`开始下载 ${urls.length} 篇文章（仅正文，免登录）……`);
+  selected.forEach(a => { a._failed = false; });
+  renderArticles(new Set(selected.map(a => a.uid)));
+  log(`开始下载选中的 ${urls.length} 篇文章（仅正文，免登录）……`);
   setStatus('导出中', 'running');
+  activeExportKind = 'reader';
+  setExporting(true);
   const r = await fetch('/api/reader_export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const d = await r.json();
-  if(d.ok) pollTask(d.task_id);
-  else log(`启动失败：${d.error}`, 'err');
+  if(d.ok){
+    exportTaskId = d.task_id;
+    pollTask(d.task_id, handleReaderSelectedResult, handleReaderProgress, () => setExporting(false));
+  } else {
+    setExporting(false);
+    log(`启动失败：${d.error}`, 'err');
+  }
 }
 
 function openQr(kind, title){

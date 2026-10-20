@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>公众号文章 + 评论导出工具</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --border: #e3e6ea; --text: #1f2329;
+    --muted: #8a919c; --primary: #2f6bff; --primary-h: #2458d6; --ok: #18a058;
+    --warn: #e08600; --err: #d03050; --mono: "SFMono-Regular", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--text); font-size: 14px; }
+  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 14px 24px;
+           display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 10; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 20px; display: grid;
+          grid-template-columns: 360px 1fr; gap: 20px; align-items: start; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+          padding: 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 14px; margin: 0 0 12px; font-weight: 600; }
+  .field { margin-bottom: 10px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .field input, .field textarea { width: 100%; padding: 7px 9px; border: 1px solid var(--border);
+          border-radius: 6px; font-size: 12px; font-family: var(--mono); }
+  .field textarea { resize: vertical; min-height: 52px; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .btn { border: none; border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+         background: var(--primary); color: #fff; transition: .15s; }
+  .btn:hover { background: var(--primary-h); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.ghost { background: #eef1f5; color: var(--text); }
+  .btn.ghost:hover { background: #e3e7ed; }
+  .btn.small { padding: 4px 9px; font-size: 12px; }
+  .btn.green { background: var(--ok); }
+  .btn.green:hover { background: #128a4a; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; background: #fafbfc; }
+  td.title { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px;
+         background: #eef1f5; color: var(--muted); }
+  .tag.ok { background: #e8f7ee; color: var(--ok); }
+  .tag.err { background: #fdecec; color: var(--err); }
+  .log { background: #1c1f24; color: #d5d9de; border-radius: 10px; padding: 12px; font-family: var(--mono);
+         font-size: 12px; max-height: 360px; overflow-y: auto; white-space: pre-wrap; line-height: 1.6; }
+  .log .warn { color: #f0a020; }
+  .log .err { color: #f06060; }
+  .log .ok { color: #5fd080; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .status-dot.running { background: var(--warn); animation: pulse 1s infinite; }
+  .status-dot.done { background: var(--ok); }
+  .status-dot.error { background: var(--err); }
+  @keyframes pulse { 50% { opacity: .4; } }
+  .comment-preview { max-height: 240px; overflow-y: auto; border: 1px solid var(--border);
+                     border-radius: 8px; padding: 10px; margin-top: 6px; background: #fafbfc; }
+  .comment-item { border-bottom: 1px dashed var(--border); padding: 6px 0; }
+  .comment-item:last-child { border-bottom: none; }
+  .comment-item .nick { font-weight: 600; font-size: 12px; }
+  .comment-item .time { color: var(--muted); font-size: 11px; margin-left: 6px; }
+  .comment-item .content { font-size: 13px; margin: 3px 0; }
+  .comment-item .reply { color: var(--primary); font-size: 12px; margin-left: 12px; border-left: 2px solid #c8d6ff; padding-left: 8px; }
+  .flex { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .mt { margin-top: 10px; }
+  .muted { color: var(--muted); }
+  .spacer { flex: 1; }
+  .tip { font-size: 12px; color: var(--muted); background: #f7f8fa; border-radius: 6px; padding: 8px 10px; line-height: 1.7; }
+  .tip code { font-family: var(--mono); background: #eef1f5; padding: 0 4px; border-radius: 4px; }
+  .mode-radio-group { display: flex; flex-direction: column; gap: 8px; }
+  .mode-radio { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border);
+                border-radius: 8px; padding: 10px 12px; cursor: pointer; transition: .15s; }
+  .mode-radio:hover { border-color: var(--primary); }
+  .mode-radio.active { border-color: var(--primary); background: #eef4ff; }
+  .mode-radio input { accent-color: var(--primary); margin: 0; }
+  .mode-radio span { font-weight: 600; font-size: 13px; }
+  .mode-radio small { color: var(--muted); font-size: 12px; }
+  .mode-desc { margin-top: 10px; font-size: 12px; color: var(--muted); background: #f7f8fa;
+               border-radius: 6px; padding: 8px 10px; line-height: 1.6; }
+  .ro-field { background: #fafbfc; border: 1px solid var(--border); border-radius: 6px;
+              padding: 8px 10px; font-size: 13px; min-height: 18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>公众号文章 + 评论导出工具</h1>
+  <span class="sub">三种模式：我的号 / 整个公众号（微信读书）/ 单篇下载</span>
+  <span class="spacer"></span>
+  <span class="sub" id="statusBar"><span class="status-dot done"></span>就绪</span>
+</header>
+
+<div class="wrap">
+  <!-- 左侧：配置 -->
+  <div>
+    <div class="card">
+      <h2>选择模式</h2>
+      <div class="mode-radio-group">
+        <label class="mode-radio active"><input type="radio" name="mode" value="1" checked onchange="switchMode('1')"><span>模式1</span><small>我的公众号 · 文章 + 完整评论</small></label>
+        <label class="mode-radio"><input type="radio" name="mode" value="2" onchange="switchMode('2')"><span>模式2</span><small>别人的号 · 整个公众号仅正文（微信读书）</small></label>
+        <label class="mode-radio"><input type="radio" name="mode" value="3" onchange="switchMode('3')"><span>模式3</span><small>单篇下载 · 免登录仅正文</small></label>
+      </div>
+      <div class="mode-desc" id="modeDesc"></div>
+    </div>
+
+    <div id="panel1" class="mode-panel">
+    <div class="card">
+      <h2>① 凭证配置</h2>
+      <div class="field">
+        <div class="row" style="justify-content:space-between">
+          <label style="margin:0">公众号后台凭证</label>
+          <button class="btn small" onclick="mpLogin()">扫码登录公众号后台</button>
+        </div>
+        <label style="margin-top:8px">token</label>
+        <input id="token" placeholder="例如 2128083566">
+        <label style="margin-top:8px">fingerprint</label>
+        <input id="fingerprint" placeholder="后台留言管理接口的 fingerprint">
+        <label style="margin-top:8px">Cookie</label>
+        <textarea id="mp_cookie" placeholder="后台 Cookie"></textarea>
+      </div>
+      <div class="row">
+        <button class="btn ghost" onclick="saveConfig()">保存配置</button>
+        <button class="btn ghost" onclick="loadConfig()">读取配置</button>
+      </div>
+      <div class="tip" style="margin-top:8px">token / fingerprint / Cookie 用于拉「原创」列表和评论（评论需后台有「留言管理」入口）。凭证有时效，失效后重新扫码即可。「原创」列表只含声明原创的文章，如需全部文章请改用后台「发表记录」。</div>
+    </div>
+
+    <div class="card">
+      <h2>② 目标公众号</h2>
+      <div class="field">
+        <label>当前公众号（扫码登录后自动识别）</label>
+        <div class="ro-field" id="mpNameDisplay">（未识别，请先扫码登录公众号后台）</div>
+      </div>
+      <div class="row">
+        <button class="btn" onclick="doFetchArticles()">拉取文章列表</button>
+      </div>
+    </div>
+    </div><!-- /panel1 -->
+
+    <!-- 模式2：别人的号 + 整个公众号（微信读书，仅正文） -->
+    <div id="panel3" class="mode-panel" style="display:none">
+      <div class="card">
+        <h2>① 微信读书凭证</h2>
+        <div class="field">
+          <div class="row" style="justify-content:space-between">
+            <label style="margin:0">微信读书 Cookie</label>
+            <button class="btn small" onclick="wereadLogin()">扫码登录微信读书</button>
+          </div>
+          <textarea id="weread_cookie" placeholder="wr_vid=...; wr_skey=...; wr_rt=..." style="margin-top:6px"></textarea>
+        </div>
+        <div class="tip" style="margin-top:8px">也可手动获取：浏览器打开 <code>weread.qq.com</code> 登录 → F12 → Application → Cookies 取 <code>wr_vid</code>、<code>wr_skey</code>、<code>wr_rt</code>，拼成 <code>wr_vid=..; wr_skey=..; wr_rt=..</code>。</div>
+      </div>
+      <div class="card">
+        <h2>② 目标公众号</h2>
+        <div class="field">
+          <label>公众号名称 / 链接 / __biz / MP_WXS_xxx，也可直接粘贴该公众号的任意一篇文章地址</label>
+          <input id="keyword" placeholder="例如：公众号名称，或 https://mp.weixin.qq.com/s/xxxx">
+        </div>
+        <div class="row">
+          <button class="btn" onclick="doFetchArticles()">拉取文章列表</button>
+        </div>
+        <div class="mt muted" id="resolveResult"></div>
+      </div>
+    </div>
+
+    <!-- 模式3：单篇下载（免登录，仅正文） -->
+    <div id="panel4" class="mode-panel" style="display:none">
+      <div class="card">
+        <h2>① 文章链接</h2>
+        <div class="field">
+          <label>每行一个文章链接，支持多行一次下载多篇</label>
+          <textarea id="reader_urls3" placeholder="https://mp.weixin.qq.com/s/xxxx&#10;https://mp.weixin.qq.com/s/yyyy" style="min-height:52px"></textarea>
+        </div>
+        <div class="tip" style="margin-bottom:8px">直接访问文章链接抓取正文，不抓评论，无需登录或任何凭证；可多行粘贴，一次下载多篇。</div>
+        <div class="row">
+          <button class="btn green" onclick="doReaderExportSingle()">下载文章</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- 右侧：结果 -->
+  <div>
+    <div class="card">
+      <h2 style="margin:0 0 10px">导出选项</h2>
+      <div class="flex" style="flex-wrap:nowrap; align-items:stretch; gap:8px">
+        <div style="border:1px solid #e3e6ea; border-radius:8px; padding:8px 12px; display:flex; flex-direction:column; gap:6px">
+          <div class="muted" style="font-size:12px; font-weight:600">输出位置</div>
+          <textarea id="output_dir" placeholder="./output" style="width:220px; min-height:52px; resize:vertical; padding:7px 9px; border:1px solid var(--border); border-radius:6px; font-size:12px; font-family:var(--mono); box-sizing:border-box"></textarea>
+        </div>
+        <div style="border:1px solid #e3e6ea; border-radius:8px; padding:8px 12px; display:flex; flex-direction:column; gap:6px">
+          <div class="muted" style="font-size:12px; font-weight:600">导出内容</div>
+          <div class="row" style="flex-wrap:nowrap; gap:8px">
+            <label class="row" style="cursor:pointer;margin:0;display:flex"><input type="checkbox" class="fmt" value="markdown" checked> Markdown</label>
+            <label class="row" style="cursor:pointer;margin:0;display:flex"><input type="checkbox" class="fmt" value="html" checked> HTML</label>
+            <label class="row" style="cursor:pointer;margin:0;display:flex"><input type="checkbox" class="fmt" value="txt" checked> TXT</label>
+            <label class="row" style="cursor:pointer;margin:0;display:flex"><input type="checkbox" class="fmt" value="pdf" checked> PDF</label>
+          </div>
+          <div class="row" style="flex-wrap:nowrap; gap:10px">
+            <label class="row" style="cursor:pointer;margin:0;display:flex;gap:5px" id="fFetchComments"><input type="checkbox" id="fetch_comments" checked> 导出评论</label>
+            <label class="row" style="cursor:pointer;margin:0;display:flex;gap:5px"><input type="checkbox" id="download_images" checked> 下载图片</label>
+          </div>
+        </div>
+        <div style="border:1px solid #e3e6ea; border-radius:8px; padding:8px 12px; display:flex; flex-direction:column; gap:6px; justify-content:center">
+          <div class="muted" style="font-size:12px; font-weight:600">文件布局</div>
+          <div class="row" style="flex-direction:column; align-items:flex-start; gap:6px">
+            <label class="row" style="cursor:pointer;margin:0;display:flex;gap:4px;white-space:nowrap"><input type="radio" name="layout" value="subdir" checked> 每篇一个子文件夹</label>
+            <label class="row" style="cursor:pointer;margin:0;display:flex;gap:4px;white-space:nowrap"><input type="radio" name="layout" value="flat"> 平铺到同一目录</label>
+          </div>
+        </div>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:8px">PDF 依赖系统自带 Chrome/Edge；「平铺」时图片放在「文章文件名_files」目录</div>
+    </div>
+
+    <div class="card">
+      <div class="flex">
+        <h2 style="margin:0">文章列表 <span class="muted" id="articleCount"></span></h2>
+        <span class="spacer"></span>
+        <button class="btn small ghost" onclick="selectAll()">全选</button>
+        <button class="btn small ghost" onclick="selectInvert()">反选</button>
+        <button class="btn small green" onclick="doDownloadSelected()">下载选中</button>
+        <label class="row" id="fThreads" style="cursor:pointer;margin:0;display:flex;gap:4px;font-size:12px;align-items:center">线程
+          <select id="threads" style="padding:2px 4px">
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="4" selected>4</option>
+            <option value="8">8</option>
+            <option value="16">16</option>
+          </select>
+        </label>
+      </div>
+      <div class="mt" style="overflow-x:auto">
+        <table>
+          <thead><tr><th style="width:30px"><input type="checkbox" id="checkAll" onclick="toggleAll(this)"></th><th>#</th><th>标题</th><th>时间</th><th>阅读/点赞</th><th>评论</th><th>操作</th></tr></thead>
+          <tbody id="articleBody"><tr><td colspan="7" class="muted">尚未拉取，请先在左侧「拉取文章列表」</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card" id="commentCard" style="display:none">
+      <h2>评论详情</h2>
+      <div id="commentDetail"></div>
+    </div>
+
+    <div class="card">
+      <h2>运行日志</h2>
+      <div class="log" id="log">等待操作……</div>
+    </div>
+  </div>
+</div>
+
+<!-- 扫码登录弹窗 -->
+<div id="qrModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:100;
+     display:none; align-items:center; justify-content:center;">
+  <div style="background:#fff; border-radius:12px; padding:24px; max-width:340px; text-align:center;">
+    <h3 id="qrTitle" style="margin:0 0 8px; font-size:16px;">扫码登录</h3>
+    <div id="qrMsg" style="color:#8a919c; font-size:13px; margin-bottom:12px;">请使用微信扫码</div>
+    <div id="qrBox" style="display:flex; align-items:center; justify-content:center; min-height:220px;">
+      <img id="qrImg" src="" style="max-width:240px; max-height:260px; display:none;">
+    </div>
+    <button class="btn ghost" onclick="closeQr()" style="margin-top:14px;">取消</button>
+  </div>
+</div>
+
+<script>
+let taskTimer = null;
+let articlesCache = [];
+let qrTimer = null;
+let qrKind = '';
+let currentBookId = '';
+let currentMpName = '';
+let currentMode = '1';
+
+function $(id){ return document.getElementById(id); }
+function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function log(msg, cls){
+  const el = $('log');
+  const div = document.createElement('div');
+  if(cls) div.className = cls;
+  div.textContent = msg;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}
+function setStatus(text, state){
+  $('statusBar').innerHTML = `<span class="status-dot ${state}"></span>${esc(text)}`;
+}
+
+function gather(){
+  return {
+    weread_cookie: ($('weread_cookie') ? $('weread_cookie').value : '').trim(),
+    token: ($('token') ? $('token').value : '').trim(),
+    fingerprint: ($('fingerprint') ? $('fingerprint').value : '').trim(),
+    mp_cookie: ($('mp_cookie') ? $('mp_cookie').value : '').trim(),
+    keyword: ($('keyword') ? $('keyword').value : '').trim(),
+    mp_name: currentMpName || '',
+    output_dir: ($('output_dir') ? $('output_dir').value : '').trim(),
+    fetch_comments: ($('fetch_comments') ? $('fetch_comments').checked : false),
+    export_formats: [...document.querySelectorAll('input.fmt:checked')].map(e => e.value),
+    layout: (document.querySelector('input[name="layout"]:checked') || {}).value || 'subdir',
+    download_images: ($('download_images') ? $('download_images').checked : true),
+    threads: parseInt(($('threads') ? $('threads').value : '4'), 10) || 4,
+  };
+}
+
+async function saveConfig(){
+  const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(gather())});
+  const d = await r.json();
+  log('配置已保存', 'ok');
+}
+async function loadConfig(){
+  const r = await fetch('/api/config');
+  const c = await r.json();
+  if(c.weread_cookie && $('weread_cookie')) $('weread_cookie').value = c.weread_cookie;
+  if(c.token && $('token')) $('token').value = c.token;
+  if(c.fingerprint && $('fingerprint')) $('fingerprint').value = c.fingerprint;
+  if(c.mp_cookie && $('mp_cookie')) $('mp_cookie').value = c.mp_cookie;
+  if(c.keyword && $('keyword')) $('keyword').value = c.keyword;
+  if(c.output_dir && $('output_dir')) $('output_dir').value = c.output_dir;
+  if(c.fetch_comments !== undefined && $('fetch_comments')) $('fetch_comments').checked = !!c.fetch_comments;
+  if(c.export_formats && c.export_formats.length)
+    document.querySelectorAll('input.fmt').forEach(e => e.checked = c.export_formats.includes(e.value));
+  if(c.layout){
+    const rb = document.querySelector(`input[name="layout"][value="${c.layout}"]`);
+    if(rb) rb.checked = true;
+  }
+  if(c.download_images !== undefined && $('download_images')) $('download_images').checked = !!c.download_images;
+  if(c.threads && $('threads')) $('threads').value = String(c.threads);
+  if(c.mp_name){ currentMpName = c.mp_name; }
+  updateMpNameDisplay();
+  log('配置已读取', 'ok');
+}
+
+async function doFetchArticles(){
+  const body = gather();
+  log('开始拉取文章列表，公众号文章较多时可能需要 10~30 秒，进度见下方日志……');
+  setStatus('拉取文章中', 'running');
+  const r = await fetch('/api/articles', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if(!d.ok){ setStatus('就绪', 'done'); log(`拉取失败：${d.error}`, 'err'); return; }
+  pollFetchTask(d.task_id);
+}
+
+function pollFetchTask(tid){
+  clearInterval(taskTimer);
+  let rendered = 0;
+  const el = $('log');
+  taskTimer = setInterval(async ()=>{
+    let d;
+    try { d = await (await fetch(`/api/task/${tid}`)).json(); }
+    catch(e){ return; }
+    const logs = d.log || [];
+    for(let i=rendered;i<logs.length;i++){ const div=document.createElement('div'); div.textContent=logs[i]; el.appendChild(div); }
+    rendered = logs.length;
+    el.scrollTop = el.scrollHeight;
+    // 增量渲染：每拉一页，后端通过 articles_sofar 返回已拉到的文章，边拉边显示
+    const sofar = d.articles_sofar || [];
+    if(sofar.length > articlesCache.length){
+      articlesCache = sofar;
+      renderArticles();
+    }
+    if(d.status === 'done'){
+      clearInterval(taskTimer);
+      setStatus('就绪', 'done');
+      const res = d.result || {};
+      articlesCache = res.articles || [];
+      currentBookId = res.book_id || '';
+      currentMpName = res.mp_name || '';
+      renderArticles();
+      updateMpNameDisplay();
+      const rr = $('resolveResult');
+      if(rr) rr.innerHTML = `✅ 当前公众号：<code>${esc(currentMpName || currentBookId)}</code>`;
+      log(`拉取成功：共 ${articlesCache.length} 篇文章${currentMpName?'（'+currentMpName+'）':''}`, 'ok');
+    } else if(d.status === 'error'){
+      clearInterval(taskTimer);
+      setStatus('失败', 'error');
+      log(`拉取失败：${d.error}`, 'err');
+    }
+  }, 800);
+}
+
+function fmtTime(ts){
+  if(!ts) return '';
+  const dt = new Date(ts*1000);
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+}
+
+function renderArticles(){
+  $('articleCount').textContent = `（共 ${articlesCache.length} 篇）`;
+  const tb = $('articleBody');
+  if(!articlesCache.length){
+    tb.innerHTML = '<tr><td colspan="7" class="muted">暂无文章</td></tr>';
+    const ca = $('checkAll'); if(ca) ca.checked = false;
+    return;
+  }
+  tb.innerHTML = articlesCache.map((a,i)=>`
+    <tr>
+      <td><input type="checkbox" class="rowCheck" data-i="${i}" checked></td>
+      <td>${i+1}</td>
+      <td class="title" title="${esc(a.title)}">${esc(a.title)}</td>
+      <td>${fmtTime(a.time)}</td>
+      <td>${a.read_num||0}/${a.like_num||0}</td>
+      <td><span class="tag">-</span></td>
+      <td><button class="btn small ghost" onclick="showArticle(${i})">预览</button></td>
+    </tr>`).join('');
+  updateCheckAll();
+}
+
+function getSelectedArticles(){
+  return [...document.querySelectorAll('input.rowCheck:checked')]
+    .map(e => articlesCache[parseInt(e.dataset.i)]).filter(Boolean);
+}
+function updateCheckAll(){
+  const boxes = [...document.querySelectorAll('input.rowCheck')];
+  const all = $('checkAll');
+  if(!all) return;
+  if(!boxes.length){ all.checked = false; return; }
+  all.checked = boxes.every(e => e.checked);
+}
+function selectAll(){
+  document.querySelectorAll('input.rowCheck').forEach(e => e.checked = true);
+  updateCheckAll();
+  log(`已全选 ${articlesCache.length} 篇`, 'ok');
+}
+function selectInvert(){
+  document.querySelectorAll('input.rowCheck').forEach(e => e.checked = !e.checked);
+  updateCheckAll();
+  log(`已反选，当前选中 ${getSelectedArticles().length} 篇`);
+}
+function toggleAll(cb){
+  document.querySelectorAll('input.rowCheck').forEach(e => e.checked = cb.checked);
+}
+
+async function showArticle(i){
+  const a = articlesCache[i];
+  if(!a) return;
+  // 仅展示标题 + 摘要（正文需导出时抓取）
+  const card = $('commentCard');
+  card.style.display = 'block';
+  $('commentDetail').innerHTML = `
+    <div class="muted" style="margin-bottom:8px">${esc(a.title)}</div>
+    <div class="tip">${esc(a.summary || '（无摘要）')}</div>
+    <div class="mt muted">正文内容将在「开始导出」时抓取，按所选格式（Markdown / HTML / TXT / PDF）写入文件。</div>`;
+}
+
+function renderComments(list){
+  const card = $('commentCard');
+  card.style.display = 'block';
+  let html = '';
+  for(const m of list){
+    const cmts = m.comments || [];
+    html += `<div class="comment-item"><div class="nick">${esc(m.title||m.comment_id)} <span class="time">${cmts.length} 条评论</span></div>`;
+    html += `<div class="comment-preview">`;
+    for(const c of cmts){
+      html += `<div class="comment-item"><span class="nick">${esc(c.nick)}</span><span class="time">${fmtTime(c.time)}</span>`;
+      if(c.elected) html += `<span class="tag ok">精选</span>`;
+      html += `<div class="content">${esc(c.content)}</div>`;
+      for(const r of (c.replies||[])){
+        html += `<div class="reply"><b>${esc(r.nick||'作者')}：</b>${esc(r.content)}</div>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div></div>`;
+  }
+  $('commentDetail').innerHTML = html || '<div class="muted">暂无评论数据</div>';
+}
+
+function pollTask(tid){
+  clearInterval(taskTimer);
+  let rendered = 0;  // 已渲染的后端日志条数，只追加新增，避免重复显示
+  const el = $('log');
+  taskTimer = setInterval(async ()=>{
+    const r = await fetch(`/api/task/${tid}`);
+    const d = await r.json();
+    const logs = d.log || [];
+    for(let i=rendered;i<logs.length;i++){ const div=document.createElement('div'); div.textContent=logs[i]; el.appendChild(div); }
+    rendered = logs.length;
+    el.scrollTop = el.scrollHeight;
+    if(d.status === 'done'){
+      clearInterval(taskTimer);
+      setStatus('完成', 'done');
+      log(d.result ? `✅ 导出完成：成功 ${d.result.ok}/${d.result.total} 篇，共 ${d.result.comments} 条评论，目录 ${d.result.dir}` : '✅ 完成', 'ok');
+    } else if(d.status === 'error'){
+      clearInterval(taskTimer);
+      setStatus('失败', 'error');
+      log(`❌ ${d.error}`, 'err');
+    }
+  }, 800);
+}
+
+async function doExport(){
+  const body = gather();
+  const hasMp = body.token && body.mp_cookie;
+  const hasWeread = body.weread_cookie && body.keyword;
+  if(!hasMp && !hasWeread){
+    log('请先填写凭证：公众号后台 token + Cookie（推荐），或微信读书 Cookie + 公众号', 'err'); return;
+  }
+  log('开始导出全部文章……');
+  setStatus('导出中', 'running');
+  const r = await fetch('/api/export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if(d.ok) pollTask(d.task_id);
+  else log(`启动失败：${d.error}`, 'err');
+}
+
+async function doExportSelected(){
+  const selected = getSelectedArticles();
+  if(!selected.length){ log('请先在文章列表中勾选要下载的文章', 'err'); return; }
+  const body = gather();
+  const hasUrl = selected.every(a => a.url);
+  if(!hasUrl && !body.weread_cookie){ log('请先填写微信读书 Cookie（这些文章需用微信读书拉正文）', 'err'); return; }
+  body.articles = selected;
+  body.book_id = currentBookId;
+  body.mp_name = currentMpName;
+  log(`开始导出选中的 ${selected.length} 篇文章……`);
+  setStatus('导出中', 'running');
+  const r = await fetch('/api/export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if(d.ok) pollTask(d.task_id);
+  else log(`启动失败：${d.error}`, 'err');
+}
+
+const MODE_PANEL = {1:'1', 2:'3', 3:'4'};
+const MODE_DESC = {
+  1: '备份你自己公众号的全部文章和留言（含未精选留言）。需要公众号后台凭证（token / fingerprint / Cookie），扫码登录后自动识别公众号。',
+  2: '通过微信读书批量下载整个公众号的文章（仅正文，不含评论）。需要微信读书 Cookie。',
+  3: '快速下载单篇文章正文。无需登录、无需任何凭证，不抓评论。',
+};
+
+function switchMode(mode){
+  ['1','2','3'].forEach(m => {
+    const p = $('panel'+MODE_PANEL[m]);
+    if(p) p.style.display = (m === mode) ? 'block' : 'none';
+  });
+  document.querySelectorAll('.mode-radio').forEach(lb => {
+    const rb = lb.querySelector('input');
+    lb.classList.toggle('active', rb && rb.value === mode);
+  });
+  const desc = $('modeDesc');
+  if(desc) desc.textContent = MODE_DESC[mode] || '';
+  // 「导出评论」仅模式1（我的号）显示
+  const isA = (mode === '1');
+  const showComments = (mode === '1');
+  const vis = {fFetchComments: showComments};
+  Object.keys(vis).forEach(id => {
+    const el = $(id);
+    if(el) el.style.display = vis[id] ? '' : 'none';
+  });
+  // 切换模式时清空文章列表（不同模式的数据相互独立）
+  currentMode = mode;
+  articlesCache = [];
+  renderArticles();
+  // 模式1 拉列表为串行分页，不显示线程选择；模式2/3 保留（用于短链提取/下载并发）
+  const ft = $('fThreads');
+  if(ft) ft.style.display = isA ? 'none' : '';
+}
+
+function doDownloadSelected(){
+  // 模式1（我的号·后台）和模式2（微信读书整号）都走 /api/export 导出选中文章
+  return doExportSelected();
+}
+
+function updateMpNameDisplay(){
+  const el = $('mpNameDisplay');
+  if(el) el.textContent = currentMpName || '（未识别，请先扫码登录公众号后台）';
+}
+
+async function doReaderExportSingle(){
+  const urls = ($('reader_urls3').value || '').split('\n').map(s=>s.trim()).filter(Boolean);
+  if(!urls.length){ log('请先粘贴文章链接', 'err'); return; }
+  const body = {
+    article_urls: urls,
+    fetch_comments: false,
+    export_formats: [...document.querySelectorAll('input.fmt:checked')].map(e => e.value),
+  };
+  log(`开始下载 ${urls.length} 篇文章（仅正文，免登录）……`);
+  setStatus('导出中', 'running');
+  const r = await fetch('/api/reader_export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if(d.ok) pollTask(d.task_id);
+  else log(`启动失败：${d.error}`, 'err');
+}
+
+function openQr(kind, title){
+  qrKind = kind;
+  $('qrTitle').textContent = title;
+  $('qrMsg').textContent = '正在生成二维码……';
+  $('qrImg').style.display = 'none';
+  $('qrModal').style.display = 'flex';
+}
+function closeQr(){
+  $('qrModal').style.display = 'none';
+  if(qrTimer) clearInterval(qrTimer);
+  qrTimer = null;
+}
+function showQrImage(src){
+  if(src.startsWith('data:image')){
+    $('qrImg').src = src;
+    $('qrImg').style.display = 'block';
+  } else if(src){
+    // 链接形式：用链接生成二维码图片（服务端已给 data URI 为主）
+    $('qrImg').src = src;
+    $('qrImg').style.display = 'block';
+  }
+}
+
+async function wereadLogin(){
+  openQr('weread', '扫码登录微信读书');
+  const r = await fetch('/api/weread_login', {method:'POST'});
+  const d = await r.json();
+  if(!d.ok){ $('qrMsg').textContent = '获取二维码失败：' + d.error; log('微信读书登录失败：'+d.error, 'err'); return; }
+  showQrImage(d.qrcode);
+  pollLogin('weread');
+}
+
+async function mpLogin(){
+  openQr('mp', '扫码登录公众号后台');
+  $('qrMsg').textContent = '正在启动浏览器窗口……';
+  const r = await fetch('/api/mp_login', {method:'POST'});
+  const d = await r.json();
+  if(!d.ok){ $('qrMsg').textContent = '启动失败：' + d.error; log('公众号后台登录失败：'+d.error, 'err'); return; }
+  $('qrMsg').innerHTML = '已弹出浏览器窗口，<b>请在窗口中使用微信扫码登录</b>。<br>登录成功后自动提取凭证，浏览器窗口会保留，可自行关闭。';
+  pollLogin('mp');
+}
+
+function pollLogin(kind){
+  clearInterval(qrTimer);
+  qrTimer = setInterval(async ()=>{
+    const url = kind === 'weread' ? '/api/weread_login_status' : '/api/mp_login_status';
+    const r = await fetch(url);
+    const d = await r.json();
+    if(d.qrcode && d.status === 'scanning' && kind === 'weread') showQrImage(d.qrcode);
+    $('qrMsg').textContent = d.message || '';
+    if(d.status === 'success' || d.status === 'partial'){
+      clearInterval(qrTimer); qrTimer = null;
+      if(kind === 'weread'){
+        $('weread_cookie').value = d.cookie || '';
+        log('微信读书登录成功，Cookie 已自动填入', 'ok');
+      } else {
+        if(d.token) $('token').value = d.token;
+        if(d.fingerprint) $('fingerprint').value = d.fingerprint;
+        if(d.cookie) $('mp_cookie').value = d.cookie;
+        if(d.book_id && $('keyword') && !$('keyword').value){
+          $('keyword').value = d.book_id;
+        }
+        if(d.nick_name){
+          currentMpName = d.nick_name;
+          currentBookId = d.book_id || '';
+          updateMpNameDisplay();
+        }
+        if(d.status === 'partial'){
+          log('公众号后台部分凭证已填入' + ($('fingerprint').value ? '' : '（fingerprint 缺失，请重试或手动从 F12 补齐）'), 'err');
+        } else {
+          log('公众号后台登录成功，已自动识别公众号' + (d.nick_name ? '：' + d.nick_name : ''), 'ok');
+        }
+      }
+      closeQr();
+    } else if(d.status === 'failed' || d.status === 'expired'){
+      clearInterval(qrTimer); qrTimer = null;
+      log((kind==='weread'?'微信读书':'公众号后台')+'登录：'+d.message, 'err');
+      $('qrMsg').textContent = d.message || '';
+      setTimeout(closeQr, 2500);
+    }
+  }, 1500);
+}
+
+switchMode('1');
+loadConfig();
+</script>
+</body>
+</html>

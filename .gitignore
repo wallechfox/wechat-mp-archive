@@ -1,0 +1,12 @@
+# 运行时生成物
+__pycache__/
+*.pyc
+output/
+config.json
+comment_map_cache.json
+
+# 系统 / IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -770,6 +770,102 @@ def fetch_article_html(cookie: str, review_id: str) -> str:
     return weread_get_html(cookie, "/web/mp/content", {"reviewId": rid})
 
 
+def weread_get_ogurl(cookie: str, review_id: str, max_bytes: int = 600_000) -> str:
+    """流式读取微信读书正文接口，读到 og:url 即断连（正文响应约 2.6MB，og:url 在前 20KB）。
+
+    返回文章短链（https://mp.weixin.qq.com/s/xxx），失败返回空串。
+    """
+    if not review_id:
+        return ""
+    rid = urllib.parse.quote(review_id)
+    sess = _weread_session()
+    sess.headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    buf = b""
+    try:
+        with sess.get(f"{WEREAD_HOST}/web/mp/content", params={"reviewId": rid},
+                      headers={"Cookie": cookie}, timeout=40, stream=True) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                buf += chunk
+                if b"og:url" in buf:
+                    text = buf.decode("utf-8", "ignore")
+                    url = extract_meta(text, "og:url")
+                    if url:
+                        return url
+                if len(buf) >= max_bytes:
+                    break
+    except Exception:
+        return ""
+    return ""
+
+
+def _brief_err(e: Exception) -> str:
+    """把异常压成一行可读文案，HTTP 错误带状态码。"""
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return f"HTTP {e.response.status_code}"
+    msg = str(e).replace("\n", " ").strip()
+    return msg[:120] or e.__class__.__name__
+
+
+def _diagnose_article_html(raw_html: str) -> str:
+    """分析「拿到了 HTML 但没有正文」的原因，返回一句中文说明。"""
+    html = raw_html or ""
+    low = html.lower()
+    if not html.strip():
+        return "返回内容为空"
+    if ("环境异常" in html or "wappoc_appmsgcaptcha" in low or "去验证" in html
+            or "secitptpage/verify" in low):
+        return "触发风控验证页"
+    if ("该内容已被发布者删除" in html or "此内容因违规无法查看" in html
+            or "内容不存在" in html or "该内容已被删除" in html
+            or "此内容被多人投诉" in html):
+        return "文章已删除或不可见"
+    if ('id="js_image_content"' in html or "js_image_wrapper" in html):
+        return "图片消息类型，正文不在 js_content"
+    if ('id="js_audio_content"' in html or 'id="js_voice"' in html):
+        return "语音消息类型，无图文正文"
+    if "扫码登录" in html or ("login" in low and "weread" in low and "js_content" not in html):
+        return "返回登录/引导页，Cookie 可能失效"
+    return f"页面无 js_content（{len(html)} 字节）"
+
+
+def attach_short_urls(cookie: str, articles: list, task=None, save_path=None) -> int:
+    """为文章列表补全短链（og:url），用于正文抓取失败时的直访回退。
+
+    逐篇流式读取 og:url（约 20KB/篇），每篇提取到就按列表顺序重写 txt，中途失败不丢已提取部分。
+    返回补全成功的篇数。
+    """
+    if not articles:
+        return 0
+    done = 0
+    todo = [a for a in articles if not a.get("url") and a.get("review_id")]
+    if task:
+        task_log(task, f"补全文章短链：{len(todo)} 篇（逐篇读取 og:url，约 1 篇/秒）")
+    for i, art in enumerate(todo, 1):
+        _check_stop(task)
+        url = weread_get_ogurl(cookie, art.get("review_id", ""))
+        if url:
+            art["url"] = url
+            done += 1
+        if save_path is not None:
+            try:
+                lines = [f"{a['title']}\t{a['url']}" for a in articles if a.get("url")]
+                if lines:
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    save_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+        if task and (i % 20 == 0 or i == len(todo)):
+            task_log(task, f"  短链补全进度 {i}/{len(todo)}，成功 {done} 篇")
+        time.sleep(0.35)
+    if task:
+        task_log(task, f"短链补全完成：成功 {done}/{len(todo)} 篇"
+                       + (f"，已保存 {save_path}" if save_path is not None and done else ""))
+    return done
+
+
 def _extract_mp_name_from_article_html(html: str) -> str:
     """从公众号文章正文 HTML 提取公众号名称（多种 meta / JS 变量兜底）。"""
     # 1) og:article:author（property）或 name="author"
@@ -1748,22 +1844,56 @@ def _export_one(art: dict, out_dir: Path, formats: set, comments_by_mid: dict,
     每篇独立目录（subdir）或独立文件名（flat），图片目录按文章名区分。
     """
     logs = []
+    raw_html = ""
+    content_html = ""
+    source = ""
+    notes = []  # 各通路的失败原因，最终汇总进报错文案，便于定位
+
     if art.get("_raw_html"):
         raw_html = art["_raw_html"]
-    elif art.get("review_id") and cookie:
-        # 微信读书接口走登录态，风控宽松；mp.weixin.qq.com 直访批量请求
-        # 易触发 IP 风控（返回 captcha 验证页），故仅作回退（模式1/3 场景）
-        raw_html = fetch_article_html(cookie, art["review_id"])
-    elif art.get("url"):
-        raw_html = fetch_article_html_direct(art["url"])
-    elif art.get("review_id"):
-        raw_html = fetch_article_html(cookie, art["review_id"])
-    else:
-        raise RuntimeError("无可用链接或 review_id")
-    content_html = extract_content_html(raw_html)
+        source = "预抓取缓存"
+        content_html = extract_content_html(raw_html)
+
+    # 通路1：微信读书正文（登录态，风控宽松，批量优先）
+    if not content_html and art.get("review_id") and cookie:
+        try:
+            raw_html = fetch_article_html(cookie, art["review_id"])
+            content_html = extract_content_html(raw_html)
+            source = "微信读书"
+            if not content_html:
+                notes.append(f"微信读书：{_diagnose_article_html(raw_html)}")
+        except Exception as e:
+            notes.append(f"微信读书：{_brief_err(e)}")
+
+    # 顺手从已拿到的页面里取短链（og:url）：既作原文链接，也作直访回退入口
+    if raw_html:
+        og = extract_meta(raw_html, "og:url") or ""
+        if og.startswith("http"):
+            if not art.get("url"):
+                art["url"] = og
+            if not art.get("content_url"):
+                art["content_url"] = og
+
+    # 通路2：短链直访（免登录，模式3 已验证纯短链稳定）
+    if not content_html and art.get("url"):
+        try:
+            raw2 = fetch_article_html_direct(art["url"])
+            c2 = extract_content_html(raw2)
+            if c2:
+                raw_html, content_html = raw2, c2
+                source = "短链直访（回退）"
+                logs.append("微信读书无正文，已改用短链直访成功")
+            else:
+                notes.append(f"短链直访：{_diagnose_article_html(raw2)}")
+        except Exception as e:
+            notes.append(f"短链直访：{_brief_err(e)}")
+
     if not content_html:
-        raise RuntimeError("未提取到正文 #js_content（可能被风控或链接失效）")
-    art["content_url"] = extract_meta(raw_html, "og:url") or ""
+        detail = "；".join(notes) if notes else "无可用链接或 review_id"
+        raise RuntimeError(f"未提取到正文（{detail}）")
+
+    art["content_url"] = (extract_meta(raw_html, "og:url") or art.get("url")
+                          or art.get("content_url") or "")
 
     safe = sanitize(art["title"])
     date = art.get("create_time") or ""
@@ -2559,7 +2689,7 @@ def api_config():
         data = request.get_json(force=True) or {}
         for k in ("weread_cookie", "token", "fingerprint", "mp_cookie", "keyword", "mp_name",
                   "output_dir", "fetch_comments", "max_articles", "export_formats",
-                  "layout", "download_images", "threads"):
+                  "layout", "download_images", "threads", "fetch_short_urls"):
             if k in data:
                 CONFIG[k] = data[k]
         save_config()
@@ -2620,6 +2750,11 @@ def fetch_articles_worker(tid):
                                                     date_from=date_from, date_to=date_to)
             if not mp_name and got_name:
                 mp_name = got_name
+        # 补全短链（可选）：正文抓取失败时可用短链直访回退
+        if data.get("fetch_short_urls") and cookie and articles:
+            save_name = f"{datetime.now().strftime('%y%m%d')}{sanitize(mp_name or book_id or '')}公众号文章链接.txt"
+            attach_short_urls(cookie, articles, task=task, save_path=OUTPUT_ROOT / save_name)
+            task["articles_sofar"] = list(articles)
         CACHE["articles"] = articles
         CACHE["book_id"] = book_id
         CACHE["mp_name"] = mp_name

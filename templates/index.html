@@ -187,6 +187,12 @@
             <input type="date" id="date_to2" style="width:auto;flex:1;min-width:120px">
           </div>
         </div>
+        <div class="field">
+          <label class="row" style="cursor:pointer;margin:0;display:flex;gap:6px">
+            <input type="checkbox" id="fetch_short_urls" checked> 拉列表时补全文章短链
+          </label>
+          <div class="tip" style="margin-top:4px">微信读书没有正文的文章，下载时可用短链直访补抓；补全较慢（约 1 篇/秒），同时会保存 <code>output/日期公众号名公众号文章链接.txt</code>。</div>
+        </div>
         <div class="row" style="justify-content:flex-end">
           <button class="btn" data-fetch-btn onclick="doFetchArticles()">拉取文章列表</button>
           <button class="btn ghost" data-stop-btn onclick="stopFetch()" style="display:none">停止拉取</button>
@@ -365,6 +371,7 @@ function gather(){
     export_formats: [...document.querySelectorAll('input.fmt:checked')].map(e => e.value),
     layout: (document.querySelector('input[name="layout"]:checked') || {}).value || 'subdir',
     download_images: ($('download_images') ? $('download_images').checked : true),
+    fetch_short_urls: ($('fetch_short_urls') ? $('fetch_short_urls').checked : false),
     // 时间范围：模式1 用 date_from1/date_to1，模式2 用 date_from2/date_to2
     date_from: (currentMode === '2' ? ($('date_from2') ? $('date_from2').value : '') : ($('date_from1') ? $('date_from1').value : '')),
     date_to: (currentMode === '2' ? ($('date_to2') ? $('date_to2').value : '') : ($('date_to1') ? $('date_to1').value : '')),
@@ -393,6 +400,7 @@ async function loadConfig(){
     if(rb) rb.checked = true;
   }
   if(c.download_images !== undefined && $('download_images')) $('download_images').checked = !!c.download_images;
+  if(c.fetch_short_urls !== undefined && $('fetch_short_urls')) $('fetch_short_urls').checked = !!c.fetch_short_urls;
   if(c.mp_name){ currentMpName = c.mp_name; }
   updateMpNameDisplay();
   log('配置已读取', 'ok');

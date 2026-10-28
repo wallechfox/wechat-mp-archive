@@ -28,6 +28,12 @@
           border-radius: 6px; font-size: 12px; font-family: var(--mono); }
   .field textarea { resize: vertical; min-height: 52px; }
   .row { display: flex; gap: 8px; align-items: center; }
+  /* 单选/复选不能继承 .field input 的 width:100%，否则标签文字会被挤成窄柱 */
+  .field input[type="radio"], .field input[type="checkbox"] { width: auto; margin: 0; flex: 0 0 auto; }
+  .radio-row { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; }
+  .radio-col { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  .radio-row label, .radio-col label { display: inline-flex; align-items: center; gap: 6px;
+          margin: 0; font-size: 12px; color: inherit; cursor: pointer; white-space: nowrap; }
   .btn { border: none; border-radius: 6px; padding: 8px 14px; font-size: 13px; cursor: pointer;
          background: var(--primary); color: #fff; transition: .15s; }
   .btn:hover { background: var(--primary-h); }
@@ -144,6 +150,14 @@
       <div class="field">
         <label>当前公众号（扫码登录后自动识别）</label>
         <div class="ro-field" id="mpNameDisplay">（未识别，请先扫码登录公众号后台）</div>
+      </div>
+      <div class="field">
+        <label>文章数据源</label>
+        <div class="radio-row">
+          <label><input type="radio" name="article_source" value="publish" checked> 全部文章（发表记录）</label>
+          <label><input type="radio" name="article_source" value="orignal"> 仅原创</label>
+        </div>
+        <div class="tip" style="margin-top:4px">「全部文章」含转载与未声明原创的内容，并自带 <code>comment_id</code>，评论可直连拉取（更快更全）；「仅原创」为旧逻辑，作回退用。</div>
       </div>
       <div class="field">
         <label>时间范围（可选，留空表示全部；只填起始日期可做增量拉取）</label>
@@ -372,6 +386,7 @@ function gather(){
     layout: (document.querySelector('input[name="layout"]:checked') || {}).value || 'subdir',
     download_images: ($('download_images') ? $('download_images').checked : true),
     fetch_short_urls: ($('fetch_short_urls') ? $('fetch_short_urls').checked : false),
+    article_source: (document.querySelector('input[name="article_source"]:checked') || {}).value || 'publish',
     // 时间范围：模式1 用 date_from1/date_to1，模式2 用 date_from2/date_to2
     date_from: (currentMode === '2' ? ($('date_from2') ? $('date_from2').value : '') : ($('date_from1') ? $('date_from1').value : '')),
     date_to: (currentMode === '2' ? ($('date_to2') ? $('date_to2').value : '') : ($('date_to1') ? $('date_to1').value : '')),
@@ -401,6 +416,10 @@ async function loadConfig(){
   }
   if(c.download_images !== undefined && $('download_images')) $('download_images').checked = !!c.download_images;
   if(c.fetch_short_urls !== undefined && $('fetch_short_urls')) $('fetch_short_urls').checked = !!c.fetch_short_urls;
+  if(c.article_source){
+    const rb = document.querySelector(`input[name="article_source"][value="${c.article_source}"]`);
+    if(rb) rb.checked = true;
+  }
   if(c.mp_name){ currentMpName = c.mp_name; }
   updateMpNameDisplay();
   log('配置已读取', 'ok');
@@ -503,13 +522,21 @@ function renderArticles(checkedUids){
     const ca = $('checkAll'); if(ca) ca.checked = false;
     return;
   }
-  tb.innerHTML = articlesCache.map((a,i)=>`
+  tb.innerHTML = articlesCache.map((a,i)=>{
+    const tags = [];
+    if(a._failed) tags.push('<span class="tag err">失败</span>');
+    if(a.is_deleted) tags.push('<span class="tag err">已删除</span>');
+    if(a.item_show_type) tags.push('<span class="tag">非图文</span>');
+    if(a.is_original === false) tags.push('<span class="tag">转载</span>');
+    const cmt = (a.comment_num != null && a.comment_num > 0) ? ` · ${a.comment_num} 评论` : '';
+    return `
     <tr class="${a._failed ? 'failed-row' : ''}">
       <td><input type="checkbox" class="rowCheck" data-i="${i}" checked></td>
       <td>${i+1}</td>
-      <td class="title" title="${esc(a.title)}">${a._failed ? '<span class="tag err">失败</span> ' : ''}${esc(a.title)}</td>
-      <td>${fmtTime(a.time)}</td>
-    </tr>`).join('');
+      <td class="title" title="${esc(a.title)}">${tags.length ? tags.join(' ') + ' ' : ''}${esc(a.title)}</td>
+      <td>${fmtTime(a.time)}${cmt}</td>
+    </tr>`;
+  }).join('');
   if(checkedUids){
     document.querySelectorAll('input.rowCheck').forEach(cb => {
       const a = articlesCache[parseInt(cb.dataset.i)];
@@ -783,7 +810,7 @@ async function doExportSelected(){
 
 const MODE_PANEL = {1:'1', 2:'3', 3:'4'};
 const MODE_DESC = {
-  1: '备份你自己公众号的全部文章和留言（含未精选留言）。需要公众号后台凭证（token / fingerprint / Cookie），扫码登录后自动识别公众号。',
+  1: '备份你自己公众号的全部文章和留言（含转载、未声明原创、未精选留言）。需要公众号后台凭证（token / fingerprint / Cookie），扫码登录后自动识别公众号。',
   2: '通过微信读书批量下载整个公众号的文章（仅正文，不含评论）。需要微信读书 Cookie。',
   3: '快速下载单篇文章正文。无需登录、无需任何凭证，不抓评论。',
 };

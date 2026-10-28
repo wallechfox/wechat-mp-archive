@@ -53,6 +53,7 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 WEREAD_HOST = "https://weread.qq.com"
 MP_COMMENT_URL = "https://mp.weixin.qq.com/misc/appmsgcomment"
 MP_COPYRIGHT_URL = "https://mp.weixin.qq.com/cgi-bin/appmsgcopyright"
+MP_PUBLISH_URL = "https://mp.weixin.qq.com/cgi-bin/appmsgpublish"
 # 评论映射本地缓存：同一公众号的 mid -> comment_id 长期稳定（文章不删重发就不会变），
 # 缓存后选中导出可直接定位评论，避免逐篇遍历 comment_id 列表。
 COMMENT_MAP_CACHE = Path(__file__).resolve().parent / "comment_map_cache.json"
@@ -979,6 +980,183 @@ def _extract_cgidata_list(html: str):
     return [], total
 
 
+def _extract_publish_page(html: str) -> dict:
+    """从「发表记录」页 HTML 解析 publish_page 对象。
+
+    页面里是 JS 赋值 publish_page = {..."publish_info":"{&quot;type&quot;:9,...}"...}，
+    注意：内层 publish_info 是「双重转义」的 JSON 字符串（值是 &quot; 包裹的字符串），
+    所以必须先用原样文本解析外层（保留 &quot; 才合法），再对内层单独 html.unescape 二次解析。
+    整体反转义会破坏外层 JSON 结构（实测报 Expecting ',' delimiter）。
+    """
+    m = re.search(r'publish_page\s*=\s*\{', html)
+    if not m:
+        return {}
+    start = m.end() - 1  # 指向 '{'
+    depth = 0
+    in_str = False
+    escape = False
+    i = start
+    while i < len(html):
+        c = html[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif c == '\\':
+                escape = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(html[start:i + 1])
+                    except Exception:
+                        return {}
+        i += 1
+    return {}
+
+
+def _parse_publish_info(raw) -> dict:
+    """publish_info 可能是 dict，也可能是 HTML 转义过的 JSON 字符串。"""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        return json.loads(unescape(raw))
+    except Exception:
+        return {}
+
+
+def _publish_items(publish_page: dict) -> list:
+    """把 publish_page.publish_list 展开成文章条目列表。
+
+    一条 publish_list = 一次「发布」或「群发」，可能含多篇：
+      - 发布（publish_type=101）→ appmsg_info[]
+      - 群发 → appmsgex[]
+    转载/特殊条目可能两者都为空，直接跳过。
+    """
+    out = []
+    for rec in (publish_page.get("publish_list") or []):
+        if not isinstance(rec, dict):
+            continue
+        info = _parse_publish_info(rec.get("publish_info"))
+        if not info:
+            continue
+        sent = info.get("sent_info") or {}
+        sent_time = int(sent.get("time") or 0)
+        arts = []
+        for key in ("appmsg_info", "appmsgex"):
+            v = info.get(key)
+            if isinstance(v, list):
+                arts.extend(v)
+        for a in arts:
+            if not isinstance(a, dict):
+                continue
+            out.append({
+                "title": (a.get("title") or "").strip(),
+                "url": a.get("content_url") or a.get("link") or "",
+                "msgid": str(a.get("appmsgid") or ""),
+                "index": str(a.get("itemidx") if a.get("itemidx") is not None else (a.get("idx") or "")),
+                "create_time": "",
+                "time": int(a.get("update_time") or sent_time or 0),
+                "reprint_num": a.get("reprint_num") or 0,
+                # 发表记录独有的几个字段：评论直连 + 状态标记
+                "comment_id": str(a.get("comment_id") or ""),
+                "comment_num": int(a.get("comment_num") or 0),
+                # 评论+回复总数（实测 comment_num 只算评论本身，这个字段含作者回复）
+                "comment_total": int(a.get("total_comment_count_contains_reply") or 0),
+                "is_original": str(a.get("copyright_type") or "0") != "0",
+                "is_deleted": bool(a.get("is_deleted")),
+                "item_show_type": int(a.get("item_show_type") or 0),
+                "read_num": int(a.get("read_num") or 0),
+                "like_num": int(a.get("like_num") or 0),
+            })
+    return out
+
+
+def fetch_all_articles_from_publish(cookie: str, token: str, task=None, max_articles=0, on_page=None,
+                                    date_from: str = "", date_to: str = ""):
+    """从「发表记录」（cgi-bin/appmsgpublish?sub=list）分页拉取全部文章（含非原创/转载）。
+
+    返回 (articles, mp_name)。total_count 是「记录数」（群发/发布次数），
+    一页 10 条记录可能展开成 10~80 篇文章，进度按展开后的文章数算。
+    """
+    articles = []
+    seen = set()
+    mp_name = ""
+    begin = 0            # begin 从 0 开始
+    total = 0
+    ts_from = _parse_date_ts(date_from)
+    ts_to = _parse_date_ts(date_to, end=True)
+    while True:
+        _check_stop(task)
+        params = {
+            "sub": "list",
+            "begin": str(begin),
+            "count": "10",
+            "token": token,
+            "lang": "zh_CN",
+        }
+        resp = requests.get(MP_PUBLISH_URL, params=params,
+                            headers=_mp_page_headers(cookie), timeout=30, verify=False)
+        resp.raise_for_status()
+        page_html = resp.text
+        if not mp_name:
+            m = re.search(r'real_nick_name\s*:\s*"([^"]*)"', page_html)
+            if not m:
+                m = re.search(r'nick_name\s*:\s*"([^"]*)"', page_html)
+            mp_name = m.group(1) if m else ""
+
+        pp = _extract_publish_page(page_html)
+        if not pp:
+            raise RuntimeError("「发表记录」返回页面中未找到 publish_page（Cookie/接口可能已变更）")
+        total = int(pp.get("total_count") or 0)
+        records = pp.get("publish_list") or []
+        if not records:
+            break
+
+        items = _publish_items(pp)
+        new_unique = 0
+        for it in items:
+            if not it.get("title"):
+                continue
+            key = f"{it['msgid']}_{it['index']}" if it.get("msgid") else (it.get("url") or it["title"])
+            if key in seen:
+                continue
+            seen.add(key)
+            new_unique += 1
+            it_ts = int(it.get("time") or 0)
+            if ts_from and it_ts and it_ts < ts_from:
+                continue
+            if ts_to and it_ts and it_ts > ts_to:
+                continue
+            articles.append(it)
+
+        if task:
+            task_log(task, f"  发表记录第 {begin // 10 + 1} 页：本页 {len(records)} 条记录 / "
+                           f"{len(items)} 篇，累计 {len(articles)}/{total or '?'}")
+        if on_page:
+            on_page(articles)
+        if max_articles and len(articles) >= max_articles:
+            break
+        if new_unique == 0:   # 整页没有新文章，避免死循环
+            break
+        # 已翻完所有记录（total_count 是记录数）
+        if total and (begin + 10) >= total:
+            break
+        if begin >= 5000:     # 安全上限：最多翻 5000 条记录
+            break
+        begin += 10
+        time.sleep(0.6)
+    return articles, mp_name
+
+
 def fetch_all_articles_from_mp(cookie: str, token: str, task=None, max_articles=0, on_page=None,
                                date_from: str = "", date_to: str = ""):
     """从公众号后台「原创」列表（appmsgcopyright?action=orignal）分页拉取全部文章。
@@ -1838,7 +2016,7 @@ def export_html_to_pdf(html_path: Path, pdf_path: Path) -> bool:
 
 
 def _export_one(art: dict, out_dir: Path, formats: set, comments_by_mid: dict,
-                layout: str, download_images: bool, cookie: str):
+                layout: str, download_images: bool, cookie: str, comments_by_cid: dict | None = None):
     """导出单篇文章，返回 (success, comment_count, logs)。
 
     每篇独立目录（subdir）或独立文件名（flat），图片目录按文章名区分。
@@ -1855,7 +2033,9 @@ def _export_one(art: dict, out_dir: Path, formats: set, comments_by_mid: dict,
         content_html = extract_content_html(raw_html)
 
     # 通路1：微信读书正文（登录态，风控宽松，批量优先）
+    tried_weread = False
     if not content_html and art.get("review_id") and cookie:
+        tried_weread = True
         try:
             raw_html = fetch_article_html(cookie, art["review_id"])
             content_html = extract_content_html(raw_html)
@@ -1882,7 +2062,8 @@ def _export_one(art: dict, out_dir: Path, formats: set, comments_by_mid: dict,
             if c2:
                 raw_html, content_html = raw2, c2
                 source = "短链直访（回退）"
-                logs.append("微信读书无正文，已改用短链直访成功")
+                logs.append("微信读书无正文，已改用短链直访成功" if tried_weread
+                            else "正文由短链直访获取")
             else:
                 notes.append(f"短链直访：{_diagnose_article_html(raw2)}")
         except Exception as e:
@@ -1926,6 +2107,11 @@ def _export_one(art: dict, out_dir: Path, formats: set, comments_by_mid: dict,
     # 匹配评论：优先按 mid（正文 HTML 里的稳定 ID）精确匹配
     art_mid = extract_mid_from_html(raw_html) or extract_mid(art.get("content_url", ""))
     comments = comments_by_mid.get(art_mid) if art_mid else None
+    if comments is None and comments_by_cid:
+        # 发表记录自带 comment_id 时，按 comment_id 直接命中（不依赖 mid）
+        cid = str(art.get("comment_id") or "")
+        if cid:
+            comments = comments_by_cid.get(cid)
     if comments is None and comments_by_mid:
         # 兜底：mid 缺失时按标题模糊匹配
         for cm in comments_by_mid.values():
@@ -1983,16 +2169,31 @@ def export_worker(task_id: str):
             task_log(task, f"使用选中的 {len(articles)} 篇文章")
         else:
             if use_mp_source:
-                task_log(task, "使用公众号后台「原创」列表拉取文章 ...")
-                articles, mp_name = fetch_all_articles_from_mp(
-                    mp_cookie, token, task=task,
-                    max_articles=int(cfg.get("max_articles", 0) or 0))
+                source = cfg.get("article_source") or "publish"
+                if source == "orignal":
+                    task_log(task, "使用公众号后台「原创」列表拉取文章 ...")
+                    articles, mp_name = fetch_all_articles_from_mp(
+                        mp_cookie, token, task=task,
+                        max_articles=int(cfg.get("max_articles", 0) or 0))
+                    task_log(task, f"共 {len(articles)} 篇（原创）")
+                else:
+                    task_log(task, "使用公众号后台「发表记录」拉取全部文章 ...")
+                    try:
+                        articles, mp_name = fetch_all_articles_from_publish(
+                            mp_cookie, token, task=task,
+                            max_articles=int(cfg.get("max_articles", 0) or 0))
+                        task_log(task, f"共 {len(articles)} 篇（发表记录）")
+                    except Exception as pe:
+                        task_log(task, f"[警告] 发表记录拉取失败：{pe}，回退「原创」列表")
+                        articles, mp_name = fetch_all_articles_from_mp(
+                            mp_cookie, token, task=task,
+                            max_articles=int(cfg.get("max_articles", 0) or 0))
+                        task_log(task, f"共 {len(articles)} 篇（原创）")
                 book_id = ""
                 CACHE["book_id"] = book_id
                 CACHE["mp_name"] = mp_name
                 if not articles:
-                    raise RuntimeError("后台「原创」列表未获取到任何文章，请检查 token 与后台 Cookie")
-                task_log(task, f"共 {len(articles)} 篇（原创）")
+                    raise RuntimeError("后台文章列表未获取到任何文章，请检查 token 与后台 Cookie")
             else:
                 task_log(task, "解析公众号 bookId ...")
                 book_id, mp_name = resolve_book_id(cookie, keyword)
@@ -2021,35 +2222,68 @@ def export_worker(task_id: str):
             if not (cred.get("token") and cred.get("fingerprint")):
                 task_log(task, "未填写 token/fingerprint，跳过评论")
                 cred = {}
+        else:
+            task_log(task, "未勾选「导出评论」，本次不抓评论（勾选后重新点「下载选中」即可）")
 
-        # 选中模式：先预抓选中文章正文，提取 mid（用于评论定位）
-        # 仅当需要拉评论（有后台凭证）时才预抓取；无评论时正文在串行导出阶段拉取
-        selected_mids = set()
-        selected_had_mids = False
-        if selected and cred:
-            task_log(task, f"预抓取 {len(articles)} 篇正文以定位评论 ...")
-            for art in articles:
-                try:
-                    raw_html = (fetch_article_html_direct(art["url"]) if art.get("url")
-                                else (fetch_article_html(cookie, art["review_id"]) if art.get("review_id") else ""))
-                    art["_raw_html"] = raw_html  # 缓存，导出时复用，避免重复抓取
-                    art["content_url"] = extract_meta(raw_html, "og:url") or ""
-                    m = extract_mid_from_html(raw_html)
-                    if m:
-                        selected_mids.add(m)
-                except Exception:
-                    pass
-            selected_had_mids = bool(selected_mids)
-            if selected_mids:
-                task_log(task, f"  已获取 {len(selected_mids)} 个 mid")
-
-        # 评论拉取（若有凭证），用 mid 建索引；配合本地缓存 mid->comment_id 避免重复遍历
         comments_by_mid = {}
+        comments_by_cid = {}
         if cred.get("token") and cred.get("fingerprint"):
             bizuin = _bizuin_from_cookie(cred.get("cookie", "")) or \
                      (book_id.replace("MP_WXS_", "") if book_id else "")
             cache_map = _load_comment_map(bizuin)
             new_map = {}  # 本次新建的 mid->comment_id，稍后回写缓存
+
+            # 0) 发表记录直接给了 comment_id：按 comment_id 直连拉评论，
+            #    不用预抓正文提 mid，也不会受 get_unread_appmsg_comment 覆盖面限制
+            with_cid = [a for a in articles if str(a.get("comment_id") or "")]
+            if with_cid:
+                todo = [a for a in with_cid
+                        if int(a.get("comment_num") or 0) > 0 or int(a.get("comment_total") or 0) > 0]
+                task_log(task, f"  列表自带 comment_id：{len(with_cid)} 篇，其中 {len(todo)} 篇有评论，按 comment_id 直连拉取 ...")
+                for i, art in enumerate(todo, 1):
+                    _check_stop(task)
+                    cid = str(art["comment_id"])
+                    try:
+                        meta = fetch_article_comments(cred, cid)
+                        comments_by_cid[cid] = meta
+                        mid = meta.get("mid") or extract_mid(meta.get("content_url", ""))
+                        if mid:
+                            comments_by_mid[mid] = meta
+                            new_map[mid] = cid
+                        task_log(task, f"  [直连 {i}/{len(todo)}] {meta.get('title','')[:30]}：{len(meta.get('comments',[]))} 条评论")
+                    except Exception as e:
+                        task_log(task, f"  [直连失败] comment_id={cid}：{e}")
+                    time.sleep(0.4)
+
+            # 直连结果体检：有评论计数却没拿到评论的，明确告警，避免「静默丢评论」
+            expecting = [a for a in articles
+                         if int(a.get("comment_num") or 0) > 0 or int(a.get("comment_total") or 0) > 0]
+            unresolved = [a for a in articles
+                          if str(a.get("comment_id") or "") not in comments_by_cid]
+            missing = [a for a in expecting if str(a.get("comment_id") or "") not in comments_by_cid]
+            if missing:
+                task_log(task, f"[警告] {len(missing)} 篇有评论计数但未取到评论，将尝试旧通道兜底 ...")
+
+            # 以下是旧通道兜底：只处理「没有 comment_id」的文章（原创列表 / 微读列表）
+            need_align = [a for a in articles if not str(a.get("comment_id") or "")]
+            selected_mids = set()
+            selected_had_mids = False
+            if selected and need_align:
+                task_log(task, f"预抓取 {len(need_align)} 篇正文以定位评论 ...")
+                for art in need_align:
+                    try:
+                        raw_html = (fetch_article_html_direct(art["url"]) if art.get("url")
+                                    else (fetch_article_html(cookie, art["review_id"]) if art.get("review_id") else ""))
+                        art["_raw_html"] = raw_html  # 缓存，导出时复用，避免重复抓取
+                        art["content_url"] = extract_meta(raw_html, "og:url") or ""
+                        m = extract_mid_from_html(raw_html)
+                        if m:
+                            selected_mids.add(m)
+                    except Exception:
+                        pass
+                selected_had_mids = bool(selected_mids)
+                if selected_mids:
+                    task_log(task, f"  已获取 {len(selected_mids)} 个 mid")
 
             # 1) 缓存命中：选中文章的 mid 已有 comment_id，直接拉详情，无需遍历
             if selected and selected_mids and cache_map:
@@ -2063,15 +2297,15 @@ def export_worker(task_id: str):
                     try:
                         meta = fetch_article_comments(cred, cid)
                         comments_by_mid[mid] = meta
+                        comments_by_cid[cid] = meta
                         selected_mids.discard(mid)
                         task_log(task, f"  [缓存] {meta.get('title','')[:30]}：{len(meta.get('comments',[]))} 条评论")
                     except Exception as e:
                         task_log(task, f"  [缓存失败] comment_id={cid}：{e}")
                     time.sleep(0.3)
 
-            # 2) 遍历 comment_id 列表：
-            #    非选中模式总是遍历（需要全部评论内容）；选中模式在「还有未命中 mid」或「预抓没拿到 mid」时遍历（兜底）
-            if (not selected) or selected_mids or (selected and not selected_had_mids):
+            # 2) 遍历 comment_id 列表（只针对还没取到评论的文章：直连失败或本来就没有 comment_id）
+            if unresolved and ((not selected) or selected_mids or (selected and not selected_had_mids)):
                 comment_articles = fetch_comment_articles(cred)
                 task_log(task, f"拉取每篇文章的评论（共 {len(comment_articles)} 篇有评论）...")
                 matched_mids = set()
@@ -2086,6 +2320,7 @@ def export_worker(task_id: str):
                         mid = meta.get("mid", "")
                         if mid:
                             comments_by_mid[mid] = meta
+                            comments_by_cid[cid] = meta
                             new_map[mid] = cid  # 记录映射，回写缓存
                             if mid in selected_mids:
                                 matched_mids.add(mid)
@@ -2142,7 +2377,7 @@ def export_worker(task_id: str):
             err_msg = ""
             try:
                 success, cc, logs = _export_one(art, out_dir, formats, comments_by_mid,
-                                                layout, download_images, cookie)
+                                                layout, download_images, cookie, comments_by_cid)
             except Exception as e:
                 success, cc, logs = False, 0, []
                 err_msg = str(e)
@@ -2689,7 +2924,8 @@ def api_config():
         data = request.get_json(force=True) or {}
         for k in ("weread_cookie", "token", "fingerprint", "mp_cookie", "keyword", "mp_name",
                   "output_dir", "fetch_comments", "max_articles", "export_formats",
-                  "layout", "download_images", "threads", "fetch_short_urls"):
+                  "layout", "download_images", "threads", "fetch_short_urls",
+                  "article_source"):
             if k in data:
                 CONFIG[k] = data[k]
         save_config()
@@ -2733,13 +2969,30 @@ def fetch_articles_worker(tid):
         if date_from or date_to:
             task_log(task, f"时间范围：{date_from or '不限'} ~ {date_to or '不限'}")
         if token and mp_cookie:
-            # 优先后台「原创」列表
-            task_log(task, "使用公众号后台「原创」列表拉取文章 ...")
-            articles, mp_name = fetch_all_articles_from_mp(
-                mp_cookie, token, task=task, max_articles=max_articles, on_page=_on_page,
-                date_from=date_from, date_to=date_to)
-            book_id = ""
-            task_log(task, f"共 {len(articles)} 篇（原创）")
+            source = data.get("article_source") or "publish"
+            if source == "orignal":
+                task_log(task, "使用公众号后台「原创」列表拉取文章 ...")
+                articles, mp_name = fetch_all_articles_from_mp(
+                    mp_cookie, token, task=task, max_articles=max_articles, on_page=_on_page,
+                    date_from=date_from, date_to=date_to)
+                book_id = ""
+                task_log(task, f"共 {len(articles)} 篇（原创）")
+            else:
+                task_log(task, "使用公众号后台「发表记录」拉取全部文章 ...")
+                try:
+                    articles, mp_name = fetch_all_articles_from_publish(
+                        mp_cookie, token, task=task, max_articles=max_articles, on_page=_on_page,
+                        date_from=date_from, date_to=date_to)
+                    book_id = ""
+                    task_log(task, f"共 {len(articles)} 篇（发表记录，含非原创/转载）")
+                except Exception as pe:
+                    # 发表记录不可用时回退原创列表，保证模式1 仍可用
+                    task_log(task, f"[警告] 发表记录拉取失败：{pe}，回退「原创」列表")
+                    articles, mp_name = fetch_all_articles_from_mp(
+                        mp_cookie, token, task=task, max_articles=max_articles, on_page=_on_page,
+                        date_from=date_from, date_to=date_to)
+                    book_id = ""
+                    task_log(task, f"共 {len(articles)} 篇（原创）")
         else:
             task_log(task, "解析公众号 bookId ...")
             book_id, mp_name = resolve_book_id(cookie, keyword)

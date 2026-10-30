@@ -2137,6 +2137,125 @@ def _export_one(art: dict, out_dir: Path, formats: set, comments_by_mid: dict,
 
 
 # ---------------------------------------------------------------------------
+# 模式分派层：模式1 = 公众号后台（自己的号）；模式2 = 微信读书（别人的号）；
+# 模式3 = 链接直抓（独立 reader_export_worker，不经过这里）
+#
+# 约定：所有「用哪套凭证、走哪个接口」的判断都集中在这一层，
+#       worker 只做调度，不再出现 token/mp_cookie 之类的外洩判断。
+# ---------------------------------------------------------------------------
+
+MODE_MP = "1"       # 公众号后台
+MODE_WEREAD = "2"   # 微信读书
+MODE_LINK = "3"     # 链接直抓
+
+
+def resolve_mode(cfg: dict) -> str:
+    """取当前模式。旧前端没带 mode 时按凭证推断，避免直接报错。"""
+    mode = str(cfg.get("mode") or "").strip()
+    if mode in (MODE_MP, MODE_WEREAD, MODE_LINK):
+        return mode
+    return MODE_MP if (cfg.get("token") and cfg.get("mp_cookie")) else MODE_WEREAD
+
+
+def mp_credentials(cfg: dict) -> dict:
+    """模式1 凭证（token + fingerprint + Cookie），缺任一返回空 dict。"""
+    cred = {
+        "token": str(cfg.get("token") or "").strip(),
+        "fingerprint": str(cfg.get("fingerprint") or "").strip(),
+        "cookie": str(cfg.get("mp_cookie") or "").strip(),
+    }
+    return cred if (cred["token"] and cred["fingerprint"]) else {}
+
+
+def weread_cookie(cfg: dict) -> str:
+    """模式2 凭证（微信读书 Cookie）。"""
+    return str(cfg.get("weread_cookie") or "").strip()
+
+
+def collect_mp_articles(task, cfg: dict, on_page=None) -> tuple:
+    """模式1：公众号后台文章列表（发表记录优先，失败回退原创）。
+
+    返回 (articles, mp_name)。book_id 恒为 ""（后台侧没有 bookId 概念）。
+    """
+    cred = mp_credentials(cfg)
+    if not (cred["token"] and cred["cookie"]):
+        raise RuntimeError("模式1 需要公众号后台 token 与 Cookie，请先扫码登录公众号后台")
+    token, mp_cookie = cred["token"], cred["cookie"]
+    max_articles = int(cfg.get("max_articles", 0) or 0)
+    date_from, date_to = cfg.get("date_from", ""), cfg.get("date_to", "")
+
+    if (cfg.get("article_source") or "publish") == "orignal":
+        task_log(task, "使用公众号后台「原创」列表拉取文章 ...")
+        articles, mp_name = fetch_all_articles_from_mp(
+            mp_cookie, token, task=task, max_articles=max_articles, on_page=on_page,
+            date_from=date_from, date_to=date_to)
+        task_log(task, f"共 {len(articles)} 篇（原创）")
+        return articles, mp_name
+
+    task_log(task, "使用公众号后台「发表记录」拉取全部文章 ...")
+    try:
+        articles, mp_name = fetch_all_articles_from_publish(
+            mp_cookie, token, task=task, max_articles=max_articles, on_page=on_page,
+            date_from=date_from, date_to=date_to)
+        task_log(task, f"共 {len(articles)} 篇（发表记录，含非原创/转载）")
+        return articles, mp_name
+    except TaskStopped:
+        raise
+    except Exception as e:
+        task_log(task, f"[警告] 发表记录拉取失败：{e}，回退「原创」列表")
+        articles, mp_name = fetch_all_articles_from_mp(
+            mp_cookie, token, task=task, max_articles=max_articles, on_page=on_page,
+            date_from=date_from, date_to=date_to)
+        task_log(task, f"共 {len(articles)} 篇（原创）")
+        return articles, mp_name
+
+
+def collect_weread_articles(task, cfg: dict, on_page=None) -> tuple:
+    """模式2：微信读书整号文章列表。返回 (articles, mp_name, book_id)。"""
+    cookie = weread_cookie(cfg)
+    if not cookie:
+        raise RuntimeError("模式2 需要微信读书 Cookie，请先扫码登录微信读书")
+    keyword = str(cfg.get("keyword") or "").strip()
+    max_articles = int(cfg.get("max_articles", 0) or 0)
+    date_from, date_to = cfg.get("date_from", ""), cfg.get("date_to", "")
+
+    task_log(task, "解析公众号 bookId ...")
+    book_id, mp_name = resolve_book_id(cookie, keyword)
+    task_log(task, f"  bookId = {book_id}" + (f"（{mp_name}）" if mp_name else ""))
+    task_log(task, "拉取全部文章列表 ...")
+    articles, got_name = fetch_all_articles(cookie, book_id, task=task, max_articles=max_articles,
+                                           on_page=on_page, date_from=date_from, date_to=date_to)
+    if not mp_name and got_name:
+        mp_name = got_name
+    task_log(task, f"共 {len(articles)} 篇文章" + (f"（{mp_name}）" if mp_name else ""))
+    return articles, mp_name, book_id
+
+
+def take_selected_articles(task, cfg: dict, mode: str) -> tuple:
+    """导出「选中文章」时不重新拉列表，这里只负责补齐名称/bookId（用于输出目录命名）。
+
+    名称来源严格按模式隔离：模式1 才允许用前端带来的「我的号」名称；
+    模式2/3 用本次拉列表解析出的目标公众号名，再不行退到目标 bookId。
+    """
+    articles = cfg.get("articles") or []
+    book_id = str(cfg.get("book_id") or CACHE.get("book_id") or "")
+    mp_name = ""
+    if mode == MODE_MP:
+        mp_name = str(cfg.get("mp_name") or "").strip()
+    if not mp_name:
+        mp_name = str(CACHE.get("mp_name") or "").strip()
+    if not mp_name:
+        for a in articles:
+            if a.get("mp_name"):
+                mp_name = str(a["mp_name"]).strip()
+                break
+    CACHE["book_id"] = book_id
+    CACHE["mp_name"] = mp_name
+    task_log(task, f"使用选中的 {len(articles)} 篇文章" + (f"（{mp_name}）" if mp_name else ""))
+    return articles, mp_name, book_id
+
+
+# ---------------------------------------------------------------------------
 # 导出任务（后台线程）
 # ---------------------------------------------------------------------------
 
@@ -2151,79 +2270,35 @@ def export_worker(task_id: str):
         results = []
         out_dir = None
         formats = set()
-        cookie = cfg.get("weread_cookie", "")
-        keyword = cfg.get("keyword", "")
-        token = cfg.get("token", "")
-        mp_cookie = cfg.get("mp_cookie", "")
+        cookie = weread_cookie(cfg)     # 仅用于取正文（模式2 的正文、模式1 的微读兜底）
         selected = cfg.get("articles") or None  # 前端勾选的文章列表（选择性下载）
-        # 数据源：填了后台 token + Cookie 则优先用公众号后台「原创」列表，否则回退微信读书
-        use_mp_source = bool(token and mp_cookie)
+        mode = resolve_mode(cfg)
+        if mode == MODE_LINK:
+            raise RuntimeError("模式3（链接直抓）请走 /api/reader_export，不经过本接口")
+
+        # ---- 文章从哪来：一次分派，两个 worker 共用同一套采集器 ----
         if selected:
-            # 选中模式：直接使用前端传入的文章列表，不再重新拉取
-            articles = selected
-            # 名称兜底：前端未带时用本次会话缓存的公众号名/bookId，避免文件夹退化成「article」
-            book_id = cfg.get("book_id") or CACHE.get("book_id") or ""
-            mp_name = cfg.get("mp_name") or CACHE.get("mp_name") or ""
-            CACHE["book_id"] = book_id
-            CACHE["mp_name"] = mp_name
-            task_log(task, f"使用选中的 {len(articles)} 篇文章")
+            articles, mp_name, book_id = take_selected_articles(task, cfg, mode)
+        elif mode == MODE_MP:
+            articles, mp_name = collect_mp_articles(task, cfg)
+            book_id = ""
+            if not articles:
+                raise RuntimeError("后台文章列表未获取到任何文章，请检查 token 与后台 Cookie")
         else:
-            if use_mp_source:
-                source = cfg.get("article_source") or "publish"
-                if source == "orignal":
-                    task_log(task, "使用公众号后台「原创」列表拉取文章 ...")
-                    articles, mp_name = fetch_all_articles_from_mp(
-                        mp_cookie, token, task=task,
-                        max_articles=int(cfg.get("max_articles", 0) or 0))
-                    task_log(task, f"共 {len(articles)} 篇（原创）")
-                else:
-                    task_log(task, "使用公众号后台「发表记录」拉取全部文章 ...")
-                    try:
-                        articles, mp_name = fetch_all_articles_from_publish(
-                            mp_cookie, token, task=task,
-                            max_articles=int(cfg.get("max_articles", 0) or 0))
-                        task_log(task, f"共 {len(articles)} 篇（发表记录）")
-                    except Exception as pe:
-                        task_log(task, f"[警告] 发表记录拉取失败：{pe}，回退「原创」列表")
-                        articles, mp_name = fetch_all_articles_from_mp(
-                            mp_cookie, token, task=task,
-                            max_articles=int(cfg.get("max_articles", 0) or 0))
-                        task_log(task, f"共 {len(articles)} 篇（原创）")
-                book_id = ""
-                CACHE["book_id"] = book_id
-                CACHE["mp_name"] = mp_name
-                if not articles:
-                    raise RuntimeError("后台文章列表未获取到任何文章，请检查 token 与后台 Cookie")
-            else:
-                task_log(task, "解析公众号 bookId ...")
-                book_id, mp_name = resolve_book_id(cookie, keyword)
-                CACHE["book_id"] = book_id
-                CACHE["mp_name"] = mp_name
-                task_log(task, f"  bookId = {book_id}  {('（' + mp_name + '）') if mp_name else ''}")
+            articles, mp_name, book_id = collect_weread_articles(task, cfg)
+            if not articles:
+                raise RuntimeError("未获取到任何文章，请检查 bookId 与 Cookie")
 
-                task_log(task, "拉取全部文章列表 ...")
-                articles, got_name = fetch_all_articles(cookie, book_id, task=task,
-                                                        max_articles=int(cfg.get("max_articles", 0) or 0))
-                if not mp_name and got_name:
-                    mp_name = got_name
-                    CACHE["mp_name"] = mp_name
-                if not articles:
-                    raise RuntimeError("未获取到任何文章，请检查 bookId 与 Cookie")
-                task_log(task, f"共 {len(articles)} 篇文章")
-
-        # 评论凭证
+        # ---- 评论：仅模式1（自己的号）才有作者视角的评论接口 ----
         cred = {}
-        if cfg.get("fetch_comments"):
-            cred = {
-                "token": cfg.get("token", ""),
-                "fingerprint": cfg.get("fingerprint", ""),
-                "cookie": cfg.get("mp_cookie", ""),
-            }
-            if not (cred.get("token") and cred.get("fingerprint")):
-                task_log(task, "未填写 token/fingerprint，跳过评论")
-                cred = {}
-        else:
+        if not cfg.get("fetch_comments"):
             task_log(task, "未勾选「导出评论」，本次不抓评论（勾选后重新点「下载选中」即可）")
+        elif mode != MODE_MP:
+            task_log(task, f"模式{mode} 不抓评论（仅模式1 支持），本次仅导出正文")
+        else:
+            cred = mp_credentials(cfg)
+            if not cred:
+                task_log(task, "未填写 token/fingerprint，跳过评论")
 
         comments_by_mid = {}
         comments_by_cid = {}
@@ -2933,81 +3008,47 @@ def api_config():
     return jsonify(CONFIG)
 
 
-@app.route("/api/resolve", methods=["POST"])
-def api_resolve():
-    data = request.get_json(force=True) or {}
-    cookie = data.get("weread_cookie", "")
-    keyword = data.get("keyword", "")
-    try:
-        book_id, mp_name = resolve_book_id(cookie, keyword)
-        CACHE["book_id"] = book_id
-        CACHE["mp_name"] = mp_name
-        return jsonify({"ok": True, "book_id": book_id, "mp_name": mp_name})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
 
 def fetch_articles_worker(tid):
-    """拉取文章列表的后台任务：实时输出进度日志，完成后 result 带 articles/mp_name。"""
+    """拉取文章列表的后台任务：按模式分派到对应采集器，统一收尾。"""
     task = TASKS[tid]
-    data = task["cfg"]
-    cookie = data.get("weread_cookie", "")
-    keyword = data.get("keyword", "")
-    token = data.get("token", "")
-    mp_cookie = data.get("mp_cookie", "")
-    max_articles = int(data.get("max_articles", 0) or 0)
-    date_from = data.get("date_from", "")
-    date_to = data.get("date_to", "")
+    cfg = task["cfg"]
+    mode = resolve_mode(cfg)
+    cookie = weread_cookie(cfg)
+    articles, mp_name, book_id = [], "", ""
 
     def _on_page(arts):
         # 每拉完一页，把当前累计文章暴露给前端增量渲染
         task["articles_sofar"] = list(arts)
 
     try:
-        book_id = ""
-        mp_name = ""
-        if date_from or date_to:
-            task_log(task, f"时间范围：{date_from or '不限'} ~ {date_to or '不限'}")
-        if token and mp_cookie:
-            source = data.get("article_source") or "publish"
-            if source == "orignal":
-                task_log(task, "使用公众号后台「原创」列表拉取文章 ...")
-                articles, mp_name = fetch_all_articles_from_mp(
-                    mp_cookie, token, task=task, max_articles=max_articles, on_page=_on_page,
-                    date_from=date_from, date_to=date_to)
-                book_id = ""
-                task_log(task, f"共 {len(articles)} 篇（原创）")
-            else:
-                task_log(task, "使用公众号后台「发表记录」拉取全部文章 ...")
-                try:
-                    articles, mp_name = fetch_all_articles_from_publish(
-                        mp_cookie, token, task=task, max_articles=max_articles, on_page=_on_page,
-                        date_from=date_from, date_to=date_to)
-                    book_id = ""
-                    task_log(task, f"共 {len(articles)} 篇（发表记录，含非原创/转载）")
-                except Exception as pe:
-                    # 发表记录不可用时回退原创列表，保证模式1 仍可用
-                    task_log(task, f"[警告] 发表记录拉取失败：{pe}，回退「原创」列表")
-                    articles, mp_name = fetch_all_articles_from_mp(
-                        mp_cookie, token, task=task, max_articles=max_articles, on_page=_on_page,
-                        date_from=date_from, date_to=date_to)
-                    book_id = ""
-                    task_log(task, f"共 {len(articles)} 篇（原创）")
+        if cfg.get("date_from") or cfg.get("date_to"):
+            task_log(task, f"时间范围：{cfg.get('date_from') or '不限'} ~ {cfg.get('date_to') or '不限'}")
+        if mode == MODE_MP:
+            articles, mp_name = collect_mp_articles(task, cfg, on_page=_on_page)
+        elif mode == MODE_LINK:
+            raise RuntimeError("模式3（链接直抓）不需要拉取文章列表，请直接粘贴链接后「导入下载列表」")
         else:
-            task_log(task, "解析公众号 bookId ...")
-            book_id, mp_name = resolve_book_id(cookie, keyword)
-            task_log(task, f"  bookId = {book_id}")
-            task_log(task, "拉取全部文章列表 ...")
-            articles, got_name = fetch_all_articles(cookie, book_id, task=task,
-                                                    max_articles=max_articles, on_page=_on_page,
-                                                    date_from=date_from, date_to=date_to)
-            if not mp_name and got_name:
-                mp_name = got_name
-        # 补全短链（可选）：正文抓取失败时可用短链直访回退
-        if data.get("fetch_short_urls") and cookie and articles:
-            save_name = f"{datetime.now().strftime('%y%m%d')}{sanitize(mp_name or book_id or '')}公众号文章链接.txt"
-            attach_short_urls(cookie, articles, task=task, save_path=OUTPUT_ROOT / save_name)
+            task_log(task, f"模式{mode}：使用微信读书接口"
+                           + ("（忽略公众号后台凭证）" if mp_credentials(cfg) else ""))
+            articles, mp_name, book_id = collect_weread_articles(task, cfg, on_page=_on_page)
+        # 补全短链（可选）：正文抓取失败时可用短链直访回退（仅微读来源需要）。
+        # 这一步很慢（约 1 篇/秒），先把列表交给前端并切成 enriching 状态，
+        # 让「下载选中」立刻可用，不要卡在「拉取中」。
+        if mode != MODE_MP and cfg.get("fetch_short_urls") and cookie and articles:
+            task["result"] = {"articles": articles, "book_id": book_id, "mp_name": mp_name}
             task["articles_sofar"] = list(articles)
+            task["status"] = "enriching"
+            task_log(task, f"列表已就绪（{len(articles)} 篇），开始补全文章链接（约 1 篇/秒，可先勾选下载）...")
+            save_name = f"{datetime.now().strftime('%y%m%d')}{sanitize(mp_name or book_id or '')}公众号文章链接.txt"
+            try:
+                attach_short_urls(cookie, articles, task=task, save_path=OUTPUT_ROOT / save_name)
+            except TaskStopped:
+                raise
+            except Exception as e:
+                task_log(task, f"[警告] 补全链接失败：{e}（不影响下载）")
+            task["articles_sofar"] = list(articles)
+            task["result"] = {"articles": articles, "book_id": book_id, "mp_name": mp_name}
         CACHE["articles"] = articles
         CACHE["book_id"] = book_id
         CACHE["mp_name"] = mp_name
@@ -3049,30 +3090,6 @@ def api_articles_stop():
     task["stop"] = True
     return jsonify({"ok": True})
 
-
-@app.route("/api/comments", methods=["POST"])
-def api_comments():
-    data = request.get_json(force=True) or {}
-    cred = {
-        "token": data.get("token", ""),
-        "fingerprint": data.get("fingerprint", ""),
-        "cookie": data.get("mp_cookie", ""),
-    }
-    try:
-        comment_articles = fetch_comment_articles(cred)
-        results = []
-        for ca in comment_articles:
-            cid = ca.get("comment_id", "")
-            try:
-                meta = fetch_article_comments(cred, cid)
-                results.append(meta)
-            except Exception as e:
-                results.append({"comment_id": cid, "title": "", "comments": [], "error": str(e)})
-            time.sleep(0.4)
-        CACHE["comments"] = {m.get("title", m.get("comment_id", "")): m for m in results}
-        return jsonify({"ok": True, "articles": results})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/api/export", methods=["POST"])

@@ -287,11 +287,6 @@
       </div>
     </div>
 
-    <div class="card" id="commentCard" style="display:none">
-      <h2>评论详情</h2>
-      <div id="commentDetail"></div>
-    </div>
-
   </div>
 </div>
 
@@ -318,6 +313,7 @@ let currentMpName = '';
 let currentMode = '1';
 let fetchTaskId = null;   // 当前拉取任务 id（用于停止）
 let fetching = false;     // 是否正在拉取文章列表
+let fetchReleasedEarly = false;  // 列表已就绪、后台仍在补全链接时提前放行过按钮
 let exportTaskId = null;  // 当前下载任务 id（用于停止）
 let activeExportKind = 'main';  // 当前下载任务类型：main（模式1/2 走 /api/export）、reader（模式3 走 /api/reader_export）
 let exportSuccess = 0;    // 当前列表累计下载成功的篇数
@@ -377,9 +373,10 @@ function gather(){
     weread_cookie: ($('weread_cookie') ? $('weread_cookie').value : '').trim(),
     token: ($('token') ? $('token').value : '').trim(),
     fingerprint: ($('fingerprint') ? $('fingerprint').value : '').trim(),
+    mode: currentMode,
     mp_cookie: ($('mp_cookie') ? $('mp_cookie').value : '').trim(),
     keyword: ($('keyword') ? $('keyword').value : '').trim(),
-    mp_name: currentMpName || '',
+    mp_name: (currentMode === '1') ? (currentMpName || '') : '',
     output_dir: ($('output_dir') ? $('output_dir').value : '').trim(),
     fetch_comments: ($('fetch_comments') ? $('fetch_comments').checked : false),
     export_formats: [...document.querySelectorAll('input.fmt:checked')].map(e => e.value),
@@ -467,19 +464,49 @@ function pollFetchTask(tid){
       articlesCache = sofar;
       renderArticles();
     }
-    if(d.status === 'done'){
+    if(d.status === 'enriching'){
+      // 列表已就绪、后台还在补全文章链接：先放开按钮，别让「下载选中」卡住
+      if(fetching){
+        fetchReleasedEarly = true;
+        setFetching(false);
+        const res = d.result || {};
+        if((res.articles || []).length) articlesCache = res.articles;
+        currentBookId = res.book_id || currentBookId;
+        currentMpName = res.mp_name || currentMpName;
+        renderArticles();
+        updateMpNameDisplay();
+        const rr = $('resolveResult');
+        if(rr) rr.innerHTML = `✅ 当前公众号：<code>${esc(currentMpName || currentBookId)}</code>`;
+        setStatus('就绪（补全链接中）', 'running');
+        log(`列表已就绪：共 ${articlesCache.length} 篇；后台仍在补全文章链接，可先勾选下载`, 'ok');
+      }
+    } else if(d.status === 'done'){
       clearInterval(taskTimer);
       setStatus('就绪', 'done');
       setFetching(false);
       const res = d.result || {};
-      articlesCache = res.articles || [];
-      currentBookId = res.book_id || '';
-      currentMpName = res.mp_name || '';
-      renderArticles();
-      updateMpNameDisplay();
+      if(!exportTaskId){
+        if(fetchReleasedEarly){
+          // enrich 阶段已提前放行：只把补到的链接合并回现有条目，避免覆盖已下载/已移除的状态
+          const byKey = {};
+          (res.articles || []).forEach(a => { byKey[(a.original_id || '') + '|' + a.title] = a; });
+          articlesCache.forEach(a => {
+            const m = byKey[(a.original_id || '') + '|' + a.title];
+            if(m && m.url) a.url = m.url;
+          });
+        } else {
+          articlesCache = res.articles || [];
+        }
+        currentBookId = res.book_id || currentBookId;
+        currentMpName = res.mp_name || currentMpName;
+        renderArticles();
+        updateMpNameDisplay();
+      }
       const rr = $('resolveResult');
       if(rr) rr.innerHTML = `✅ 当前公众号：<code>${esc(currentMpName || currentBookId)}</code>`;
-      log(`拉取成功：共 ${articlesCache.length} 篇文章${currentMpName?'（'+currentMpName+'）':''}`, 'ok');
+      log(`拉取成功：共 ${articlesCache.length} 篇文章${currentMpName?'（'+currentMpName+'）':''}` +
+          (fetchReleasedEarly ? '（文章链接已补全）' : ''), 'ok');
+      fetchReleasedEarly = false;
     } else if(d.status === 'stopped'){
       clearInterval(taskTimer);
       setStatus('就绪', 'done');
@@ -580,57 +607,6 @@ function renderKeepChecked(){
     if(a) cb.checked = checked.has(a.uid);
   });
   updateCheckAll();
-}
-
-async function showArticle(i){
-  const a = articlesCache[i];
-  if(!a) return;
-  // 仅展示标题 + 摘要（正文需导出时抓取）
-  const card = $('commentCard');
-  card.style.display = 'block';
-  $('commentDetail').innerHTML = `
-    <div class="muted" style="margin-bottom:8px">${esc(a.title)}</div>
-    <div class="tip">${esc(a.summary || '（无摘要）')}</div>
-    <div class="mt muted">正文内容将在「开始导出」时抓取，按所选格式（Markdown / HTML / TXT / PDF）写入文件。</div>`;
-}
-
-async function doFetchComments(){
-  const body = gather();
-  if(!body.token || !body.fingerprint){ log('请先填写 token 和 fingerprint', 'err'); return; }
-  log('拉取评论中（每篇文章依次请求，可能较慢）……');
-  setStatus('拉取评论中', 'running');
-  const r = await fetch('/api/comments', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  const d = await r.json();
-  setStatus('就绪', 'done');
-  if(d.ok){
-    const list = d.articles || [];
-    renderComments(list);
-    log(`评论拉取完成：共 ${list.length} 篇文章有评论`, 'ok');
-  } else {
-    log(`评论拉取失败：${d.error}`, 'err');
-  }
-}
-
-function renderComments(list){
-  const card = $('commentCard');
-  card.style.display = 'block';
-  let html = '';
-  for(const m of list){
-    const cmts = m.comments || [];
-    html += `<div class="comment-item"><div class="nick">${esc(m.title||m.comment_id)} <span class="time">${cmts.length} 条评论</span></div>`;
-    html += `<div class="comment-preview">`;
-    for(const c of cmts){
-      html += `<div class="comment-item"><span class="nick">${esc(c.nick)}</span><span class="time">${fmtTime(c.time)}</span>`;
-      if(c.elected) html += `<span class="tag ok">精选</span>`;
-      html += `<div class="content">${esc(c.content)}</div>`;
-      for(const r of (c.replies||[])){
-        html += `<div class="reply"><b>${esc(r.nick||'作者')}：</b>${esc(r.content)}</div>`;
-      }
-      html += `</div>`;
-    }
-    html += `</div></div>`;
-  }
-  $('commentDetail').innerHTML = html || '<div class="muted">暂无评论数据</div>';
 }
 
 function pollTask(tid, onDone, onProgress, onFinish){
@@ -766,20 +742,6 @@ function handleReaderSelectedResult(res){
   }
 }
 
-async function doExport(){
-  const body = gather();
-  const hasMp = body.token && body.mp_cookie;
-  const hasWeread = body.weread_cookie && body.keyword;
-  if(!hasMp && !hasWeread){
-    log('请先填写凭证：公众号后台 token + Cookie（推荐），或微信读书 Cookie + 公众号', 'err'); return;
-  }
-  log('开始导出全部文章……');
-  setStatus('导出中', 'running');
-  const r = await fetch('/api/export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  const d = await r.json();
-  if(d.ok) pollTask(d.task_id);
-  else log(`启动失败：${d.error}`, 'err');
-}
 
 async function doExportSelected(){
   ensureUids();
@@ -790,7 +752,8 @@ async function doExportSelected(){
   if(!hasUrl && !body.weread_cookie){ log('请先填写微信读书 Cookie（这些文章需用微信读书拉正文）', 'err'); return; }
   body.articles = selected;
   body.book_id = currentBookId;
-  body.mp_name = currentMpName;
+  // 模式1 才带「我的号」名称；模式2/3 由后端用本次拉到的目标公众号名
+  body.mp_name = (currentMode === '1') ? currentMpName : '';
   // 重试前清掉旧的失败标记（成功后会被移除，失败会重新标红）
   selected.forEach(a => { a._failed = false; });
   renderArticles(new Set(selected.map(a => a.uid)));
@@ -837,7 +800,15 @@ function switchMode(mode){
   currentMode = mode;
   articlesCache = [];
   exportSuccess = 0;
+  // 切出模式1 时清掉「我的号」的名称/bookId，避免模式2/3 的文件夹被命名成自己的号
+  if(mode !== '1'){
+    currentMpName = '';
+    currentBookId = '';
+  }
   renderArticles();
+  updateMpNameDisplay();
+  const rr = $('resolveResult');
+  if(rr) rr.innerHTML = '';
 }
 
 function doDownloadSelected(){
@@ -1008,9 +979,8 @@ function pollLogin(kind){
         if(d.token) $('token').value = d.token;
         if(d.fingerprint) $('fingerprint').value = d.fingerprint;
         if(d.cookie) $('mp_cookie').value = d.cookie;
-        if(d.book_id && $('keyword') && !$('keyword').value){
-          $('keyword').value = d.book_id;
-        }
+        // 不再把「自己的」bookId 自动填进模式2 的「目标公众号」输入框，
+        // 否则登录后台后切到模式2 会默认去拉自己号（已由 mode 参数修正后端数据源）
         if(d.nick_name){
           currentMpName = d.nick_name;
           currentBookId = d.book_id || '';
